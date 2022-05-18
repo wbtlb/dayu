@@ -1,0 +1,2784 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="534" onload="init(evt)" viewBox="0 0 1200 534" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="534.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="517" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="517" > </text>
+<g id="frames">
+<g >
+<title>ngx_http_core_rewrite_phase (36 samples, 0.31%)</title><rect x="576.1" y="277" width="3.6" height="15.0" fill="rgb(236,82,6)" rx="2" ry="2" />
+<text  x="579.10" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_script_copy_var_len_code (32 samples, 0.27%)</title><rect x="197.4" y="197" width="3.2" height="15.0" fill="rgb(236,179,16)" rx="2" ry="2" />
+<text  x="200.36" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_copy_filter (1,180 samples, 10.04%)</title><rect x="900.2" y="245" width="118.5" height="15.0" fill="rgb(225,102,30)" rx="2" ry="2" />
+<text  x="903.22" y="255.5" >ngx_http_copy_..</text>
+</g>
+<g >
+<title>lua_settop (2 samples, 0.02%)</title><rect x="462.5" y="149" width="0.2" height="15.0" fill="rgb(248,208,24)" rx="2" ry="2" />
+<text  x="465.54" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_nonblocking (181 samples, 1.54%)</title><rect x="465.5" y="181" width="18.1" height="15.0" fill="rgb(243,121,44)" rx="2" ry="2" />
+<text  x="468.45" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_init_request (6 samples, 0.05%)</title><rect x="1189.2" y="421" width="0.6" height="15.0" fill="rgb(228,71,10)" rx="2" ry="2" />
+<text  x="1192.20" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_http_gzip_body_filter (1 samples, 0.01%)</title><rect x="10.0" y="341" width="0.1" height="15.0" fill="rgb(229,43,48)" rx="2" ry="2" />
+<text  x="13.00" y="351.5" ></text>
+</g>
+<g >
+<title>ngx_output_chain (1,178 samples, 10.02%)</title><rect x="900.4" y="229" width="118.3" height="15.0" fill="rgb(243,122,28)" rx="2" ry="2" />
+<text  x="903.42" y="239.5" >ngx_output_chain</text>
+</g>
+<g >
+<title>lj_obj_equal (2 samples, 0.02%)</title><rect x="451.2" y="101" width="0.2" height="15.0" fill="rgb(222,108,5)" rx="2" ry="2" />
+<text  x="454.19" y="111.5" ></text>
+</g>
+<g >
+<title>lua_settop (4 samples, 0.03%)</title><rect x="149.4" y="197" width="0.4" height="15.0" fill="rgb(205,0,21)" rx="2" ry="2" />
+<text  x="152.37" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_addition_body_filter (1,171 samples, 9.96%)</title><rect x="901.1" y="165" width="117.6" height="15.0" fill="rgb(231,213,52)" rx="2" ry="2" />
+<text  x="904.12" y="175.5" >ngx_http_addit..</text>
+</g>
+<g >
+<title>lua_gettop (3 samples, 0.03%)</title><rect x="169.4" y="181" width="0.3" height="15.0" fill="rgb(230,195,28)" rx="2" ry="2" />
+<text  x="172.45" y="191.5" ></text>
+</g>
+<g >
+<title>lj_str_new (14 samples, 0.12%)</title><rect x="427.9" y="101" width="1.4" height="15.0" fill="rgb(250,216,25)" rx="2" ry="2" />
+<text  x="430.90" y="111.5" ></text>
+</g>
+<g >
+<title>ngx_unix_recv (620 samples, 5.28%)</title><rect x="645.9" y="293" width="62.2" height="15.0" fill="rgb(249,227,25)" rx="2" ry="2" />
+<text  x="648.89" y="303.5" >ngx_un..</text>
+</g>
+<g >
+<title>ngx_http_lua_del_thread.part.9 (12 samples, 0.10%)</title><rect x="169.3" y="213" width="1.3" height="15.0" fill="rgb(248,94,47)" rx="2" ry="2" />
+<text  x="172.35" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_gzip_body_filter (1,170 samples, 9.96%)</title><rect x="901.2" y="117" width="117.5" height="15.0" fill="rgb(226,5,34)" rx="2" ry="2" />
+<text  x="904.23" y="127.5" >ngx_http_gzip_..</text>
+</g>
+<g >
+<title>lua_gettop (2 samples, 0.02%)</title><rect x="463.0" y="133" width="0.2" height="15.0" fill="rgb(206,175,18)" rx="2" ry="2" />
+<text  x="466.04" y="143.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0ced5 (3 samples, 0.03%)</title><rect x="32.1" y="469" width="0.3" height="15.0" fill="rgb(228,43,0)" rx="2" ry="2" />
+<text  x="35.09" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_ignore_header_line (3 samples, 0.03%)</title><rect x="643.5" y="277" width="0.3" height="15.0" fill="rgb(222,92,17)" rx="2" ry="2" />
+<text  x="646.48" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_writev.part.0 (1,145 samples, 9.74%)</title><rect x="903.7" y="53" width="115.0" height="15.0" fill="rgb(216,97,23)" rx="2" ry="2" />
+<text  x="906.74" y="63.5" >ngx_writev.par..</text>
+</g>
+<g >
+<title>0x7ff0fdd0c321 (2 samples, 0.02%)</title><rect x="26.9" y="469" width="0.2" height="15.0" fill="rgb(229,202,47)" rx="2" ry="2" />
+<text  x="29.87" y="479.5" ></text>
+</g>
+<g >
+<title>lj_vmeta_tgetv (2 samples, 0.02%)</title><rect x="168.3" y="213" width="0.2" height="15.0" fill="rgb(233,95,13)" rx="2" ry="2" />
+<text  x="171.34" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_charset_body_filter (1,171 samples, 9.96%)</title><rect x="901.1" y="149" width="117.6" height="15.0" fill="rgb(219,144,9)" rx="2" ry="2" />
+<text  x="904.12" y="159.5" >ngx_http_chars..</text>
+</g>
+<g >
+<title>recv (437 samples, 3.72%)</title><rect x="84.5" y="293" width="43.9" height="15.0" fill="rgb(219,219,53)" rx="2" ry="2" />
+<text  x="87.50" y="303.5" >recv</text>
+</g>
+<g >
+<title>ngx_http_upstream_finalize_request (2,886 samples, 24.56%)</title><rect x="729.5" y="293" width="289.8" height="15.0" fill="rgb(236,21,19)" rx="2" ry="2" />
+<text  x="732.53" y="303.5" >ngx_http_upstream_finalize_request</text>
+</g>
+<g >
+<title>ngx_strlcasestrn (2 samples, 0.02%)</title><rect x="632.3" y="261" width="0.2" height="15.0" fill="rgb(220,110,15)" rx="2" ry="2" />
+<text  x="635.33" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_capture_header_filter (15 samples, 0.13%)</title><rect x="611.0" y="293" width="1.6" height="15.0" fill="rgb(227,42,9)" rx="2" ry="2" />
+<text  x="614.04" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_http_read_client_request_body (6 samples, 0.05%)</title><rect x="1189.2" y="437" width="0.6" height="15.0" fill="rgb(219,27,45)" rx="2" ry="2" />
+<text  x="1192.20" y="447.5" ></text>
+</g>
+<g >
+<title>0x7ff0d4587378 (3 samples, 0.03%)</title><rect x="10.1" y="469" width="0.3" height="15.0" fill="rgb(253,153,3)" rx="2" ry="2" />
+<text  x="13.10" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_strncasecmp (2 samples, 0.02%)</title><rect x="30.2" y="421" width="0.2" height="15.0" fill="rgb(254,31,45)" rx="2" ry="2" />
+<text  x="33.18" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_balancer_by_chunk (415 samples, 3.53%)</title><rect x="421.1" y="165" width="41.6" height="15.0" fill="rgb(206,113,22)" rx="2" ry="2" />
+<text  x="424.07" y="175.5" >ngx..</text>
+</g>
+<g >
+<title>lj_mem_newgco (2 samples, 0.02%)</title><rect x="25.2" y="421" width="0.2" height="15.0" fill="rgb(227,176,50)" rx="2" ry="2" />
+<text  x="28.16" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_filename_cmp (6 samples, 0.05%)</title><rect x="572.1" y="245" width="0.6" height="15.0" fill="rgb(248,48,37)" rx="2" ry="2" />
+<text  x="575.09" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_close_connection (23 samples, 0.20%)</title><rect x="708.7" y="277" width="2.4" height="15.0" fill="rgb(205,148,16)" rx="2" ry="2" />
+<text  x="711.74" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_addition_body_filter (1 samples, 0.01%)</title><rect x="10.0" y="389" width="0.1" height="15.0" fill="rgb(209,126,27)" rx="2" ry="2" />
+<text  x="13.00" y="399.5" ></text>
+</g>
+<g >
+<title>lj_tab_next (11 samples, 0.09%)</title><rect x="450.3" y="117" width="1.1" height="15.0" fill="rgb(241,187,12)" rx="2" ry="2" />
+<text  x="453.29" y="127.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_balancer_free_peer (5 samples, 0.04%)</title><rect x="899.3" y="277" width="0.5" height="15.0" fill="rgb(239,21,49)" rx="2" ry="2" />
+<text  x="902.32" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_worker_process_cycle (11,459 samples, 97.51%)</title><rect x="38.4" y="373" width="1150.6" height="15.0" fill="rgb(226,3,49)" rx="2" ry="2" />
+<text  x="41.42" y="383.5" >ngx_worker_process_cycle</text>
+</g>
+<g >
+<title>ngx_http_copy_filter (39 samples, 0.33%)</title><rect x="1022.6" y="245" width="3.9" height="15.0" fill="rgb(248,60,52)" rx="2" ry="2" />
+<text  x="1025.62" y="255.5" ></text>
+</g>
+<g >
+<title>__GI_memset (5 samples, 0.04%)</title><rect x="645.4" y="277" width="0.5" height="15.0" fill="rgb(224,70,25)" rx="2" ry="2" />
+<text  x="648.38" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_writev.part.0 (966 samples, 8.22%)</title><rect x="1086.8" y="245" width="97.0" height="15.0" fill="rgb(209,114,52)" rx="2" ry="2" />
+<text  x="1089.78" y="255.5" >ngx_writev...</text>
+</g>
+<g >
+<title>propagatemark (10 samples, 0.09%)</title><rect x="460.6" y="117" width="1.0" height="15.0" fill="rgb(218,206,10)" rx="2" ry="2" />
+<text  x="463.63" y="127.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0bf45 (2 samples, 0.02%)</title><rect x="26.0" y="469" width="0.2" height="15.0" fill="rgb(223,218,29)" rx="2" ry="2" />
+<text  x="28.96" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_writev (2 samples, 0.02%)</title><rect x="903.5" y="53" width="0.2" height="15.0" fill="rgb(245,164,8)" rx="2" ry="2" />
+<text  x="906.53" y="63.5" ></text>
+</g>
+<g >
+<title>ngx_http_validate_host.isra.2 (3 samples, 0.03%)</title><rect x="582.1" y="277" width="0.3" height="15.0" fill="rgb(253,1,2)" rx="2" ry="2" />
+<text  x="585.13" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_parse_request_line (71 samples, 0.60%)</title><rect x="129.3" y="309" width="7.1" height="15.0" fill="rgb(235,116,23)" rx="2" ry="2" />
+<text  x="132.29" y="319.5" ></text>
+</g>
+<g >
+<title>lua_rawget (6 samples, 0.05%)</title><rect x="158.1" y="213" width="0.6" height="15.0" fill="rgb(244,193,37)" rx="2" ry="2" />
+<text  x="161.10" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_trailers_filter (1 samples, 0.01%)</title><rect x="10.0" y="421" width="0.1" height="15.0" fill="rgb(227,188,13)" rx="2" ry="2" />
+<text  x="13.00" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_alloc (4 samples, 0.03%)</title><rect x="645.0" y="277" width="0.4" height="15.0" fill="rgb(252,216,50)" rx="2" ry="2" />
+<text  x="647.98" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_ssi_header_filter (3 samples, 0.03%)</title><rect x="603.0" y="245" width="0.3" height="15.0" fill="rgb(253,188,44)" rx="2" ry="2" />
+<text  x="606.01" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_process_request (3,099 samples, 26.37%)</title><rect x="708.1" y="309" width="311.2" height="15.0" fill="rgb(232,86,21)" rx="2" ry="2" />
+<text  x="711.14" y="319.5" >ngx_http_upstream_process_request</text>
+</g>
+<g >
+<title>0x7ff0fdd0ba09 (3 samples, 0.03%)</title><rect x="10.5" y="469" width="0.3" height="15.0" fill="rgb(241,198,48)" rx="2" ry="2" />
+<text  x="13.50" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_core_find_location (27 samples, 0.23%)</title><rect x="570.0" y="261" width="2.7" height="15.0" fill="rgb(237,169,36)" rx="2" ry="2" />
+<text  x="572.98" y="271.5" ></text>
+</g>
+<g >
+<title>__libc_malloc (7 samples, 0.06%)</title><rect x="586.1" y="261" width="0.7" height="15.0" fill="rgb(227,229,40)" rx="2" ry="2" />
+<text  x="589.14" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_hash_find (42 samples, 0.36%)</title><rect x="638.4" y="277" width="4.2" height="15.0" fill="rgb(237,228,32)" rx="2" ry="2" />
+<text  x="641.36" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_log_request (2 samples, 0.02%)</title><rect x="719.7" y="261" width="0.2" height="15.0" fill="rgb(248,73,27)" rx="2" ry="2" />
+<text  x="722.69" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_ffi_shdict_get (1 samples, 0.01%)</title><rect x="10.4" y="453" width="0.1" height="15.0" fill="rgb(250,210,11)" rx="2" ry="2" />
+<text  x="13.40" y="463.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0d25d (4 samples, 0.03%)</title><rect x="35.8" y="469" width="0.4" height="15.0" fill="rgb(242,227,45)" rx="2" ry="2" />
+<text  x="38.80" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_create_pool (19 samples, 0.16%)</title><rect x="202.1" y="197" width="1.9" height="15.0" fill="rgb(211,64,20)" rx="2" ry="2" />
+<text  x="205.08" y="207.5" ></text>
+</g>
+<g >
+<title>lj_alloc_malloc (5 samples, 0.04%)</title><rect x="152.3" y="165" width="0.5" height="15.0" fill="rgb(205,163,0)" rx="2" ry="2" />
+<text  x="155.28" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (22 samples, 0.19%)</title><rect x="566.5" y="229" width="2.2" height="15.0" fill="rgb(205,192,48)" rx="2" ry="2" />
+<text  x="569.46" y="239.5" ></text>
+</g>
+<g >
+<title>lj_vm_returnp (2 samples, 0.02%)</title><rect x="455.3" y="133" width="0.2" height="15.0" fill="rgb(245,195,36)" rx="2" ry="2" />
+<text  x="458.31" y="143.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (2 samples, 0.02%)</title><rect x="427.7" y="85" width="0.2" height="15.0" fill="rgb(246,72,44)" rx="2" ry="2" />
+<text  x="430.70" y="95.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_reset_ctx (12 samples, 0.10%)</title><rect x="158.9" y="229" width="1.2" height="15.0" fill="rgb(250,72,9)" rx="2" ry="2" />
+<text  x="161.91" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_spawn_process (11,459 samples, 97.51%)</title><rect x="38.4" y="389" width="1150.6" height="15.0" fill="rgb(248,40,52)" rx="2" ry="2" />
+<text  x="41.42" y="399.5" >ngx_spawn_process</text>
+</g>
+<g >
+<title>ngx_http_variable_host (4 samples, 0.03%)</title><rect x="200.0" y="165" width="0.4" height="15.0" fill="rgb(215,48,45)" rx="2" ry="2" />
+<text  x="202.97" y="175.5" ></text>
+</g>
+<g >
+<title>_int_free (18 samples, 0.15%)</title><rect x="897.5" y="261" width="1.8" height="15.0" fill="rgb(252,122,24)" rx="2" ry="2" />
+<text  x="900.51" y="271.5" ></text>
+</g>
+<g >
+<title>lua_gettop (9 samples, 0.08%)</title><rect x="171.6" y="213" width="0.9" height="15.0" fill="rgb(252,78,20)" rx="2" ry="2" />
+<text  x="174.56" y="223.5" ></text>
+</g>
+<g >
+<title>posix_memalign (6 samples, 0.05%)</title><rect x="607.4" y="165" width="0.6" height="15.0" fill="rgb(214,9,0)" rx="2" ry="2" />
+<text  x="610.43" y="175.5" ></text>
+</g>
+<g >
+<title>luaL_ref (33 samples, 0.28%)</title><rect x="147.3" y="213" width="3.3" height="15.0" fill="rgb(210,127,14)" rx="2" ry="2" />
+<text  x="150.26" y="223.5" ></text>
+</g>
+<g >
+<title>lua_rawseti (2 samples, 0.02%)</title><rect x="716.8" y="213" width="0.2" height="15.0" fill="rgb(206,179,14)" rx="2" ry="2" />
+<text  x="719.78" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_keepalive_handler (583 samples, 4.96%)</title><rect x="69.8" y="325" width="58.6" height="15.0" fill="rgb(254,94,47)" rx="2" ry="2" />
+<text  x="72.84" y="335.5" >ngx_ht..</text>
+</g>
+<g >
+<title>ngx_parse_url (25 samples, 0.21%)</title><rect x="28.0" y="437" width="2.5" height="15.0" fill="rgb(209,143,42)" rx="2" ry="2" />
+<text  x="30.97" y="447.5" ></text>
+</g>
+<g >
+<title>__errno_location (2 samples, 0.02%)</title><rect x="354.6" y="181" width="0.2" height="15.0" fill="rgb(225,197,11)" rx="2" ry="2" />
+<text  x="357.60" y="191.5" ></text>
+</g>
+<g >
+<title>_init (3 samples, 0.03%)</title><rect x="202.1" y="165" width="0.3" height="15.0" fill="rgb(221,224,10)" rx="2" ry="2" />
+<text  x="205.08" y="175.5" ></text>
+</g>
+<g >
+<title>lj_obj_equal (4 samples, 0.03%)</title><rect x="177.3" y="165" width="0.4" height="15.0" fill="rgb(223,9,50)" rx="2" ry="2" />
+<text  x="180.28" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_list_push (3 samples, 0.03%)</title><rect x="634.0" y="277" width="0.3" height="15.0" fill="rgb(244,66,46)" rx="2" ry="2" />
+<text  x="637.04" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_ssi_body_filter (1,171 samples, 9.96%)</title><rect x="901.1" y="133" width="117.6" height="15.0" fill="rgb(239,72,21)" rx="2" ry="2" />
+<text  x="904.12" y="143.5" >ngx_http_ssi_b..</text>
+</g>
+<g >
+<title>__GI_memset (9 samples, 0.08%)</title><rect x="568.7" y="229" width="0.9" height="15.0" fill="rgb(225,84,12)" rx="2" ry="2" />
+<text  x="571.67" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_ffi_set_ctx_ref (10 samples, 0.09%)</title><rect x="10.8" y="453" width="1.0" height="15.0" fill="rgb(228,11,45)" rx="2" ry="2" />
+<text  x="13.80" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_insert_timer_value (11 samples, 0.09%)</title><rect x="1186.2" y="277" width="1.1" height="15.0" fill="rgb(212,100,49)" rx="2" ry="2" />
+<text  x="1189.18" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_init_request (3,808 samples, 32.40%)</title><rect x="183.8" y="229" width="382.4" height="15.0" fill="rgb(229,36,43)" rx="2" ry="2" />
+<text  x="186.81" y="239.5" >ngx_http_upstream_init_request</text>
+</g>
+<g >
+<title>lua_rawget (2 samples, 0.02%)</title><rect x="170.2" y="197" width="0.2" height="15.0" fill="rgb(248,78,24)" rx="2" ry="2" />
+<text  x="173.15" y="207.5" ></text>
+</g>
+<g >
+<title>gc_sweep (9 samples, 0.08%)</title><rect x="459.7" y="101" width="0.9" height="15.0" fill="rgb(217,178,34)" rx="2" ry="2" />
+<text  x="462.73" y="111.5" ></text>
+</g>
+<g >
+<title>ngx_http_request_handler (6 samples, 0.05%)</title><rect x="586.8" y="325" width="0.6" height="15.0" fill="rgb(212,99,19)" rx="2" ry="2" />
+<text  x="589.85" y="335.5" ></text>
+</g>
+<g >
+<title>lj_gc_step (124 samples, 1.06%)</title><rect x="12.2" y="437" width="12.5" height="15.0" fill="rgb(228,76,21)" rx="2" ry="2" />
+<text  x="15.21" y="447.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_balancer_init_peer (6 samples, 0.05%)</title><rect x="184.8" y="213" width="0.6" height="15.0" fill="rgb(244,99,27)" rx="2" ry="2" />
+<text  x="187.81" y="223.5" ></text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="1027.6" y="261" width="0.2" height="15.0" fill="rgb(236,202,15)" rx="2" ry="2" />
+<text  x="1030.64" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_new_thread (125 samples, 1.06%)</title><rect x="146.4" y="229" width="12.5" height="15.0" fill="rgb(216,187,37)" rx="2" ry="2" />
+<text  x="149.35" y="239.5" ></text>
+</g>
+<g >
+<title>lj_strscan_num (2 samples, 0.02%)</title><rect x="27.1" y="453" width="0.2" height="15.0" fill="rgb(206,53,22)" rx="2" ry="2" />
+<text  x="30.07" y="463.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0cbf2 (2 samples, 0.02%)</title><rect x="31.1" y="469" width="0.2" height="15.0" fill="rgb(207,26,10)" rx="2" ry="2" />
+<text  x="34.09" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_run_posted_requests (13 samples, 0.11%)</title><rect x="587.4" y="325" width="1.4" height="15.0" fill="rgb(239,162,46)" rx="2" ry="2" />
+<text  x="590.45" y="335.5" ></text>
+</g>
+<g >
+<title>ngx_http_close_request.isra.5 (2 samples, 0.02%)</title><rect x="179.7" y="261" width="0.2" height="15.0" fill="rgb(228,143,54)" rx="2" ry="2" />
+<text  x="182.69" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_shdict_expire.isra.2 (1 samples, 0.01%)</title><rect x="10.4" y="437" width="0.1" height="15.0" fill="rgb(221,41,51)" rx="2" ry="2" />
+<text  x="13.40" y="447.5" ></text>
+</g>
+<g >
+<title>_init (12 samples, 0.10%)</title><rect x="421.5" y="149" width="1.2" height="15.0" fill="rgb(206,65,43)" rx="2" ry="2" />
+<text  x="424.47" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (2 samples, 0.02%)</title><rect x="28.5" y="421" width="0.2" height="15.0" fill="rgb(232,158,5)" rx="2" ry="2" />
+<text  x="31.48" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_http_write_filter (6 samples, 0.05%)</title><rect x="608.1" y="213" width="0.6" height="15.0" fill="rgb(234,16,37)" rx="2" ry="2" />
+<text  x="611.13" y="223.5" ></text>
+</g>
+<g >
+<title>lj_alloc_malloc (12 samples, 0.10%)</title><rect x="156.9" y="149" width="1.2" height="15.0" fill="rgb(227,4,30)" rx="2" ry="2" />
+<text  x="159.90" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_close_connection (1,654 samples, 14.07%)</title><rect x="730.9" y="277" width="166.1" height="15.0" fill="rgb(229,54,42)" rx="2" ry="2" />
+<text  x="733.93" y="287.5" >ngx_close_connection</text>
+</g>
+<g >
+<title>ngx_http_finalize_request (5 samples, 0.04%)</title><rect x="180.1" y="261" width="0.5" height="15.0" fill="rgb(217,138,31)" rx="2" ry="2" />
+<text  x="183.09" y="271.5" ></text>
+</g>
+<g >
+<title>stack_init (53 samples, 0.45%)</title><rect x="152.8" y="181" width="5.3" height="15.0" fill="rgb(231,129,1)" rx="2" ry="2" />
+<text  x="155.78" y="191.5" ></text>
+</g>
+<g >
+<title>lua_rawget (17 samples, 0.14%)</title><rect x="176.0" y="197" width="1.7" height="15.0" fill="rgb(207,164,26)" rx="2" ry="2" />
+<text  x="178.98" y="207.5" ></text>
+</g>
+<g >
+<title>_int_malloc (4 samples, 0.03%)</title><rect x="607.6" y="133" width="0.4" height="15.0" fill="rgb(246,59,7)" rx="2" ry="2" />
+<text  x="610.63" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_limit_req_handler (3 samples, 0.03%)</title><rect x="574.2" y="261" width="0.3" height="15.0" fill="rgb(205,157,45)" rx="2" ry="2" />
+<text  x="577.20" y="271.5" ></text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="372.4" y="165" width="0.2" height="15.0" fill="rgb(245,207,29)" rx="2" ry="2" />
+<text  x="375.37" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_balancer_get_peer (450 samples, 3.83%)</title><rect x="420.3" y="181" width="45.2" height="15.0" fill="rgb(235,117,10)" rx="2" ry="2" />
+<text  x="423.27" y="191.5" >ngx_..</text>
+</g>
+<g >
+<title>lj_tab_get (8 samples, 0.07%)</title><rect x="176.9" y="181" width="0.8" height="15.0" fill="rgb(224,48,25)" rx="2" ry="2" />
+<text  x="179.88" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_ngx_ctx_add_cleanup (10 samples, 0.09%)</title><rect x="10.8" y="437" width="1.0" height="15.0" fill="rgb(240,64,5)" rx="2" ry="2" />
+<text  x="13.80" y="447.5" ></text>
+</g>
+<g >
+<title>ngx_http_script_copy_len_code (9 samples, 0.08%)</title><rect x="195.9" y="197" width="0.9" height="15.0" fill="rgb(241,171,15)" rx="2" ry="2" />
+<text  x="198.86" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_gzip_body_filter (2 samples, 0.02%)</title><rect x="1189.8" y="357" width="0.2" height="15.0" fill="rgb(248,91,53)" rx="2" ry="2" />
+<text  x="1192.80" y="367.5" ></text>
+</g>
+<g >
+<title>ngx_http_script_flush_no_cacheable_variables (7 samples, 0.06%)</title><rect x="200.6" y="197" width="0.7" height="15.0" fill="rgb(246,139,3)" rx="2" ry="2" />
+<text  x="203.58" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_chunked_body_filter (2 samples, 0.02%)</title><rect x="1189.8" y="341" width="0.2" height="15.0" fill="rgb(217,45,40)" rx="2" ry="2" />
+<text  x="1192.80" y="351.5" ></text>
+</g>
+<g >
+<title>_int_malloc (5 samples, 0.04%)</title><rect x="586.3" y="245" width="0.5" height="15.0" fill="rgb(226,136,29)" rx="2" ry="2" />
+<text  x="589.34" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_http_process_request_line (4,561 samples, 38.81%)</title><rect x="128.9" y="325" width="457.9" height="15.0" fill="rgb(226,58,28)" rx="2" ry="2" />
+<text  x="131.88" y="335.5" >ngx_http_process_request_line</text>
+</g>
+<g >
+<title>ngx_rbtree_insert (46 samples, 0.39%)</title><rect x="561.5" y="197" width="4.7" height="15.0" fill="rgb(230,90,11)" rx="2" ry="2" />
+<text  x="564.54" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_handler (2 samples, 0.02%)</title><rect x="579.7" y="293" width="0.2" height="15.0" fill="rgb(213,111,21)" rx="2" ry="2" />
+<text  x="582.72" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_http_cleanup_add (2 samples, 0.02%)</title><rect x="184.6" y="213" width="0.2" height="15.0" fill="rgb(214,65,0)" rx="2" ry="2" />
+<text  x="187.61" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_chunked_body_filter (1,170 samples, 9.96%)</title><rect x="901.2" y="101" width="117.5" height="15.0" fill="rgb(254,15,43)" rx="2" ry="2" />
+<text  x="904.23" y="111.5" >ngx_http_chunk..</text>
+</g>
+<g >
+<title>ngx_http_script_copy_code (20 samples, 0.17%)</title><rect x="193.8" y="197" width="2.1" height="15.0" fill="rgb(234,8,0)" rx="2" ry="2" />
+<text  x="196.85" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_process_request_header (2 samples, 0.02%)</title><rect x="583.6" y="293" width="0.2" height="15.0" fill="rgb(241,43,25)" rx="2" ry="2" />
+<text  x="586.63" y="303.5" ></text>
+</g>
+<g >
+<title>lj_BC_RET1 (5 samples, 0.04%)</title><rect x="435.8" y="133" width="0.5" height="15.0" fill="rgb(235,93,42)" rx="2" ry="2" />
+<text  x="438.83" y="143.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0bbf4 (2 samples, 0.02%)</title><rect x="11.8" y="469" width="0.2" height="15.0" fill="rgb(234,91,5)" rx="2" ry="2" />
+<text  x="14.81" y="479.5" ></text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="161.8" y="213" width="0.2" height="15.0" fill="rgb(251,212,0)" rx="2" ry="2" />
+<text  x="164.82" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_gzip_body_filter (4 samples, 0.03%)</title><rect x="1025.0" y="117" width="0.4" height="15.0" fill="rgb(234,153,25)" rx="2" ry="2" />
+<text  x="1028.03" y="127.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_socket_tcp_read (5 samples, 0.04%)</title><rect x="128.4" y="309" width="0.5" height="15.0" fill="rgb(245,84,5)" rx="2" ry="2" />
+<text  x="131.38" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_reusable_connection (12 samples, 0.10%)</title><rect x="726.7" y="277" width="1.2" height="15.0" fill="rgb(227,184,23)" rx="2" ry="2" />
+<text  x="729.72" y="287.5" ></text>
+</g>
+<g >
+<title>lj_alloc_f (2 samples, 0.02%)</title><rect x="156.7" y="149" width="0.2" height="15.0" fill="rgb(254,198,46)" rx="2" ry="2" />
+<text  x="159.70" y="159.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0cee3 (28 samples, 0.24%)</title><rect x="32.4" y="469" width="2.8" height="15.0" fill="rgb(227,23,6)" rx="2" ry="2" />
+<text  x="35.39" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_delete (3 samples, 0.03%)</title><rect x="83.0" y="309" width="0.3" height="15.0" fill="rgb(231,189,25)" rx="2" ry="2" />
+<text  x="86.00" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_destroy_pool (23 samples, 0.20%)</title><rect x="897.0" y="277" width="2.3" height="15.0" fill="rgb(224,101,32)" rx="2" ry="2" />
+<text  x="900.01" y="287.5" ></text>
+</g>
+<g >
+<title>gc_sweep (2 samples, 0.02%)</title><rect x="460.4" y="85" width="0.2" height="15.0" fill="rgb(222,220,46)" rx="2" ry="2" />
+<text  x="463.43" y="95.5" ></text>
+</g>
+<g >
+<title>lj_vmeta_tgetv (32 samples, 0.27%)</title><rect x="455.7" y="133" width="3.2" height="15.0" fill="rgb(249,22,32)" rx="2" ry="2" />
+<text  x="458.71" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_mirror_handler (4 samples, 0.03%)</title><rect x="574.5" y="261" width="0.4" height="15.0" fill="rgb(229,80,54)" rx="2" ry="2" />
+<text  x="577.50" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_read_request_header (3 samples, 0.03%)</title><rect x="585.4" y="309" width="0.3" height="15.0" fill="rgb(240,221,44)" rx="2" ry="2" />
+<text  x="588.44" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_capture_body_filter (26 samples, 0.22%)</title><rect x="1023.8" y="213" width="2.6" height="15.0" fill="rgb(249,31,20)" rx="2" ry="2" />
+<text  x="1026.82" y="223.5" ></text>
+</g>
+<g >
+<title>lj_BC_GGET (7 samples, 0.06%)</title><rect x="429.3" y="133" width="0.7" height="15.0" fill="rgb(243,138,21)" rx="2" ry="2" />
+<text  x="432.31" y="143.5" ></text>
+</g>
+<g >
+<title>index2adr (4 samples, 0.03%)</title><rect x="176.5" y="181" width="0.4" height="15.0" fill="rgb(240,33,16)" rx="2" ry="2" />
+<text  x="179.48" y="191.5" ></text>
+</g>
+<g >
+<title>lua_settop (2 samples, 0.02%)</title><rect x="158.7" y="213" width="0.2" height="15.0" fill="rgb(237,68,14)" rx="2" ry="2" />
+<text  x="161.70" y="223.5" ></text>
+</g>
+<g >
+<title>recv (2 samples, 0.02%)</title><rect x="1189.6" y="357" width="0.2" height="15.0" fill="rgb(223,62,40)" rx="2" ry="2" />
+<text  x="1192.60" y="367.5" ></text>
+</g>
+<g >
+<title>_setjmp (2 samples, 0.02%)</title><rect x="162.0" y="213" width="0.2" height="15.0" fill="rgb(253,101,42)" rx="2" ry="2" />
+<text  x="165.02" y="223.5" ></text>
+</g>
+<g >
+<title>lj_obj_equal (6 samples, 0.05%)</title><rect x="158.1" y="181" width="0.6" height="15.0" fill="rgb(213,53,26)" rx="2" ry="2" />
+<text  x="161.10" y="191.5" ></text>
+</g>
+<g >
+<title>lua_rawgeti (2 samples, 0.02%)</title><rect x="148.1" y="197" width="0.2" height="15.0" fill="rgb(228,40,22)" rx="2" ry="2" />
+<text  x="151.06" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (6 samples, 0.05%)</title><rect x="1018.7" y="261" width="0.6" height="15.0" fill="rgb(212,20,50)" rx="2" ry="2" />
+<text  x="1021.70" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_headers_filter (92 samples, 0.78%)</title><rect x="601.8" y="293" width="9.2" height="15.0" fill="rgb(206,85,23)" rx="2" ry="2" />
+<text  x="604.81" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_http_process_request_uri (2 samples, 0.02%)</title><rect x="585.2" y="309" width="0.2" height="15.0" fill="rgb(247,0,17)" rx="2" ry="2" />
+<text  x="588.24" y="319.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (4 samples, 0.03%)</title><rect x="191.7" y="197" width="0.4" height="15.0" fill="rgb(237,80,17)" rx="2" ry="2" />
+<text  x="194.74" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_run_posted_requests (2 samples, 0.02%)</title><rect x="585.7" y="309" width="0.2" height="15.0" fill="rgb(209,151,3)" rx="2" ry="2" />
+<text  x="588.74" y="319.5" ></text>
+</g>
+<g >
+<title>lua_setexdata (5 samples, 0.04%)</title><rect x="145.5" y="229" width="0.5" height="15.0" fill="rgb(225,142,4)" rx="2" ry="2" />
+<text  x="148.45" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_connect (6 samples, 0.05%)</title><rect x="1189.2" y="405" width="0.6" height="15.0" fill="rgb(238,191,40)" rx="2" ry="2" />
+<text  x="1192.20" y="415.5" ></text>
+</g>
+<g >
+<title>lj_vm_exit_interp (12 samples, 0.10%)</title><rect x="166.7" y="213" width="1.2" height="15.0" fill="rgb(245,162,24)" rx="2" ry="2" />
+<text  x="169.74" y="223.5" ></text>
+</g>
+<g >
+<title>__GI_memset (46 samples, 0.39%)</title><rect x="76.5" y="277" width="4.6" height="15.0" fill="rgb(250,184,33)" rx="2" ry="2" />
+<text  x="79.47" y="287.5" ></text>
+</g>
+<g >
+<title>lj_gc_step (19 samples, 0.16%)</title><rect x="459.7" y="133" width="1.9" height="15.0" fill="rgb(250,26,24)" rx="2" ry="2" />
+<text  x="462.73" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_epoll_add_connection (461 samples, 3.92%)</title><rect x="372.0" y="181" width="46.3" height="15.0" fill="rgb(214,85,28)" rx="2" ry="2" />
+<text  x="374.97" y="191.5" >ngx_..</text>
+</g>
+<g >
+<title>main (11,459 samples, 97.51%)</title><rect x="38.4" y="437" width="1150.6" height="15.0" fill="rgb(220,176,41)" rx="2" ry="2" />
+<text  x="41.42" y="447.5" >main</text>
+</g>
+<g >
+<title>lj_tab_get (4 samples, 0.03%)</title><rect x="718.9" y="213" width="0.4" height="15.0" fill="rgb(226,190,15)" rx="2" ry="2" />
+<text  x="721.88" y="223.5" ></text>
+</g>
+<g >
+<title>json_protect_conversion (2 samples, 0.02%)</title><rect x="128.4" y="245" width="0.2" height="15.0" fill="rgb(214,37,46)" rx="2" ry="2" />
+<text  x="131.38" y="255.5" ></text>
+</g>
+<g >
+<title>__close_nocancel (3 samples, 0.03%)</title><rect x="69.5" y="293" width="0.3" height="15.0" fill="rgb(232,4,41)" rx="2" ry="2" />
+<text  x="72.54" y="303.5" ></text>
+</g>
+<g >
+<title>lua_getfield (12 samples, 0.10%)</title><rect x="463.2" y="117" width="1.2" height="15.0" fill="rgb(214,136,13)" rx="2" ry="2" />
+<text  x="466.24" y="127.5" ></text>
+</g>
+<g >
+<title>ngx_http_gunzip_body_filter (2 samples, 0.02%)</title><rect x="1189.8" y="421" width="0.2" height="15.0" fill="rgb(234,152,17)" rx="2" ry="2" />
+<text  x="1192.80" y="431.5" ></text>
+</g>
+<g >
+<title>lj_alloc_malloc (2 samples, 0.02%)</title><rect x="25.2" y="405" width="0.2" height="15.0" fill="rgb(238,11,19)" rx="2" ry="2" />
+<text  x="28.16" y="415.5" ></text>
+</g>
+<g >
+<title>lj_BC_ISF (2 samples, 0.02%)</title><rect x="430.4" y="133" width="0.2" height="15.0" fill="rgb(233,68,3)" rx="2" ry="2" />
+<text  x="433.41" y="143.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0d347 (3 samples, 0.03%)</title><rect x="36.5" y="469" width="0.3" height="15.0" fill="rgb(222,159,14)" rx="2" ry="2" />
+<text  x="39.51" y="479.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (7 samples, 0.06%)</title><rect x="606.3" y="213" width="0.7" height="15.0" fill="rgb(208,161,43)" rx="2" ry="2" />
+<text  x="609.33" y="223.5" ></text>
+</g>
+<g >
+<title>lj_gc_step (2 samples, 0.02%)</title><rect x="1189.0" y="437" width="0.2" height="15.0" fill="rgb(246,141,38)" rx="2" ry="2" />
+<text  x="1192.00" y="447.5" ></text>
+</g>
+<g >
+<title>recv (8 samples, 0.07%)</title><rect x="1188.0" y="293" width="0.8" height="15.0" fill="rgb(222,106,6)" rx="2" ry="2" />
+<text  x="1190.99" y="303.5" ></text>
+</g>
+<g >
+<title>__libc_malloc (4 samples, 0.03%)</title><rect x="645.0" y="261" width="0.4" height="15.0" fill="rgb(219,150,16)" rx="2" ry="2" />
+<text  x="647.98" y="271.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0c533 (2 samples, 0.02%)</title><rect x="27.1" y="469" width="0.2" height="15.0" fill="rgb(236,193,53)" rx="2" ry="2" />
+<text  x="30.07" y="479.5" ></text>
+</g>
+<g >
+<title>lj_trace_exit (2 samples, 0.02%)</title><rect x="1189.0" y="453" width="0.2" height="15.0" fill="rgb(245,192,8)" rx="2" ry="2" />
+<text  x="1192.00" y="463.5" ></text>
+</g>
+<g >
+<title>_int_free (5 samples, 0.04%)</title><rect x="722.6" y="261" width="0.5" height="15.0" fill="rgb(231,14,5)" rx="2" ry="2" />
+<text  x="725.60" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_process_host (7 samples, 0.06%)</title><rect x="581.7" y="293" width="0.7" height="15.0" fill="rgb(246,154,28)" rx="2" ry="2" />
+<text  x="584.73" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_event_accept (17 samples, 0.14%)</title><rect x="67.8" y="325" width="1.7" height="15.0" fill="rgb(221,91,1)" rx="2" ry="2" />
+<text  x="70.84" y="335.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="184.6" y="197" width="0.2" height="15.0" fill="rgb(236,136,44)" rx="2" ry="2" />
+<text  x="187.61" y="207.5" ></text>
+</g>
+<g >
+<title>writev (1,137 samples, 9.67%)</title><rect x="904.5" y="37" width="114.2" height="15.0" fill="rgb(218,180,41)" rx="2" ry="2" />
+<text  x="907.54" y="47.5" >writev</text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="171.4" y="213" width="0.2" height="15.0" fill="rgb(237,159,44)" rx="2" ry="2" />
+<text  x="174.36" y="223.5" ></text>
+</g>
+<g >
+<title>lua_rawget (6 samples, 0.05%)</title><rect x="718.7" y="229" width="0.6" height="15.0" fill="rgb(237,118,8)" rx="2" ry="2" />
+<text  x="721.68" y="239.5" ></text>
+</g>
+<g >
+<title>lj_BC_IFUNCV (3 samples, 0.03%)</title><rect x="162.2" y="213" width="0.3" height="15.0" fill="rgb(231,203,39)" rx="2" ry="2" />
+<text  x="165.22" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_read_client_request_body (14 samples, 0.12%)</title><rect x="178.1" y="245" width="1.4" height="15.0" fill="rgb(243,94,30)" rx="2" ry="2" />
+<text  x="181.08" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_inet_addr.part.0 (2 samples, 0.02%)</title><rect x="28.3" y="421" width="0.2" height="15.0" fill="rgb(209,33,27)" rx="2" ry="2" />
+<text  x="31.27" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_http_access_handler (2 samples, 0.02%)</title><rect x="142.5" y="261" width="0.2" height="15.0" fill="rgb(250,42,24)" rx="2" ry="2" />
+<text  x="145.54" y="271.5" ></text>
+</g>
+<g >
+<title>_int_malloc (4 samples, 0.03%)</title><rect x="645.0" y="245" width="0.4" height="15.0" fill="rgb(236,60,48)" rx="2" ry="2" />
+<text  x="647.98" y="255.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0ba73 (10 samples, 0.09%)</title><rect x="10.8" y="469" width="1.0" height="15.0" fill="rgb(240,111,14)" rx="2" ry="2" />
+<text  x="13.80" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_inet_addr.part.0 (1 samples, 0.01%)</title><rect x="33.6" y="421" width="0.1" height="15.0" fill="rgb(223,39,16)" rx="2" ry="2" />
+<text  x="36.60" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_http_proxy_process_header (215 samples, 1.83%)</title><rect x="613.1" y="293" width="21.5" height="15.0" fill="rgb(246,69,15)" rx="2" ry="2" />
+<text  x="616.05" y="303.5" >n..</text>
+</g>
+<g >
+<title>lj_cont_dispatch (2 samples, 0.02%)</title><rect x="165.0" y="213" width="0.2" height="15.0" fill="rgb(231,10,41)" rx="2" ry="2" />
+<text  x="168.03" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_userid_filter (92 samples, 0.78%)</title><rect x="601.8" y="277" width="9.2" height="15.0" fill="rgb(208,134,12)" rx="2" ry="2" />
+<text  x="604.81" y="287.5" ></text>
+</g>
+<g >
+<title>__connect_nocancel (2 samples, 0.02%)</title><rect x="372.2" y="165" width="0.2" height="15.0" fill="rgb(217,200,1)" rx="2" ry="2" />
+<text  x="375.17" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_init_round_robin_peer (2 samples, 0.02%)</title><rect x="185.0" y="197" width="0.2" height="15.0" fill="rgb(246,12,46)" rx="2" ry="2" />
+<text  x="188.01" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_writev.part.0 (1 samples, 0.01%)</title><rect x="10.0" y="277" width="0.1" height="15.0" fill="rgb(232,149,2)" rx="2" ry="2" />
+<text  x="13.00" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_range_header_filter (4 samples, 0.03%)</title><rect x="602.6" y="245" width="0.4" height="15.0" fill="rgb(253,21,24)" rx="2" ry="2" />
+<text  x="605.61" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_http_parse_header_line (18 samples, 0.15%)</title><rect x="579.9" y="293" width="1.8" height="15.0" fill="rgb(229,193,39)" rx="2" ry="2" />
+<text  x="582.92" y="303.5" ></text>
+</g>
+<g >
+<title>__libc_malloc (1 samples, 0.01%)</title><rect x="1187.9" y="245" width="0.1" height="15.0" fill="rgb(233,160,49)" rx="2" ry="2" />
+<text  x="1190.89" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_linux_sendfile_chain (970 samples, 8.25%)</title><rect x="1086.4" y="261" width="97.4" height="15.0" fill="rgb(250,146,29)" rx="2" ry="2" />
+<text  x="1089.38" y="271.5" >ngx_linux_s..</text>
+</g>
+<g >
+<title>__fcntl (167 samples, 1.42%)</title><rect x="354.8" y="181" width="16.8" height="15.0" fill="rgb(244,39,32)" rx="2" ry="2" />
+<text  x="357.80" y="191.5" ></text>
+</g>
+<g >
+<title>lj_vm_call_dispatch_f (15 samples, 0.13%)</title><rect x="165.2" y="213" width="1.5" height="15.0" fill="rgb(238,166,47)" rx="2" ry="2" />
+<text  x="168.23" y="223.5" ></text>
+</g>
+<g >
+<title>posix_memalign (6 samples, 0.05%)</title><rect x="75.7" y="261" width="0.6" height="15.0" fill="rgb(242,121,6)" rx="2" ry="2" />
+<text  x="78.67" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_proxy_handler (3,876 samples, 32.98%)</title><rect x="180.6" y="261" width="389.2" height="15.0" fill="rgb(210,217,12)" rx="2" ry="2" />
+<text  x="183.59" y="271.5" >ngx_http_proxy_handler</text>
+</g>
+<g >
+<title>posix_memalign (1 samples, 0.01%)</title><rect x="1187.9" y="261" width="0.1" height="15.0" fill="rgb(229,145,3)" rx="2" ry="2" />
+<text  x="1190.89" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_handle_read_event (5 samples, 0.04%)</title><rect x="69.0" y="293" width="0.5" height="15.0" fill="rgb(223,59,37)" rx="2" ry="2" />
+<text  x="72.04" y="303.5" ></text>
+</g>
+<g >
+<title>lua_pcall (359 samples, 3.05%)</title><rect x="422.9" y="149" width="36.0" height="15.0" fill="rgb(233,204,52)" rx="2" ry="2" />
+<text  x="425.88" y="159.5" >lua..</text>
+</g>
+<g >
+<title>ngx_http_upstream_process_header_line (7 samples, 0.06%)</title><rect x="633.3" y="277" width="0.7" height="15.0" fill="rgb(219,99,4)" rx="2" ry="2" />
+<text  x="636.34" y="287.5" ></text>
+</g>
+<g >
+<title>lj_tab_get (6 samples, 0.05%)</title><rect x="158.1" y="197" width="0.6" height="15.0" fill="rgb(224,64,1)" rx="2" ry="2" />
+<text  x="161.10" y="207.5" ></text>
+</g>
+<g >
+<title>__epoll_wait_nocancel (227 samples, 1.93%)</title><rect x="45.0" y="325" width="22.8" height="15.0" fill="rgb(244,131,16)" rx="2" ry="2" />
+<text  x="48.04" y="335.5" >_..</text>
+</g>
+<g >
+<title>luaL_unref (18 samples, 0.15%)</title><rect x="715.2" y="229" width="1.8" height="15.0" fill="rgb(225,140,16)" rx="2" ry="2" />
+<text  x="718.17" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_sprintf_num (1 samples, 0.01%)</title><rect x="610.2" y="181" width="0.1" height="15.0" fill="rgb(240,119,14)" rx="2" ry="2" />
+<text  x="613.24" y="191.5" ></text>
+</g>
+<g >
+<title>recv (2 samples, 0.02%)</title><rect x="1189.8" y="277" width="0.2" height="15.0" fill="rgb(226,40,45)" rx="2" ry="2" />
+<text  x="1192.80" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_core_access_phase (373 samples, 3.17%)</title><rect x="142.0" y="277" width="37.5" height="15.0" fill="rgb(211,59,27)" rx="2" ry="2" />
+<text  x="145.04" y="287.5" >ngx..</text>
+</g>
+<g >
+<title>ngx_http_process_request (12 samples, 0.10%)</title><rect x="582.4" y="293" width="1.2" height="15.0" fill="rgb(252,203,41)" rx="2" ry="2" />
+<text  x="585.43" y="303.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0d3df (7 samples, 0.06%)</title><rect x="37.0" y="469" width="0.7" height="15.0" fill="rgb(235,173,20)" rx="2" ry="2" />
+<text  x="40.01" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_handler (5,967 samples, 50.77%)</title><rect x="588.8" y="325" width="599.1" height="15.0" fill="rgb(215,84,22)" rx="2" ry="2" />
+<text  x="591.75" y="335.5" >ngx_http_upstream_handler</text>
+</g>
+<g >
+<title>ngx_http_lua_reset_ctx (8 samples, 0.07%)</title><rect x="464.6" y="165" width="0.9" height="15.0" fill="rgb(226,158,16)" rx="2" ry="2" />
+<text  x="467.65" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="201.3" y="197" width="0.2" height="15.0" fill="rgb(235,137,5)" rx="2" ry="2" />
+<text  x="204.28" y="207.5" ></text>
+</g>
+<g >
+<title>gc_onestep (9 samples, 0.08%)</title><rect x="459.7" y="117" width="0.9" height="15.0" fill="rgb(205,155,19)" rx="2" ry="2" />
+<text  x="462.73" y="127.5" ></text>
+</g>
+<g >
+<title>ngx_http_output_filter (48 samples, 0.41%)</title><rect x="1022.3" y="261" width="4.8" height="15.0" fill="rgb(219,82,22)" rx="2" ry="2" />
+<text  x="1025.32" y="271.5" ></text>
+</g>
+<g >
+<title>recv (613 samples, 5.22%)</title><rect x="646.6" y="277" width="61.5" height="15.0" fill="rgb(226,27,49)" rx="2" ry="2" />
+<text  x="649.59" y="287.5" >recv</text>
+</g>
+<g >
+<title>lj_vm_exit_interp (27 samples, 0.23%)</title><rect x="452.0" y="133" width="2.7" height="15.0" fill="rgb(240,25,28)" rx="2" ry="2" />
+<text  x="455.00" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_charset_body_filter (1 samples, 0.01%)</title><rect x="10.0" y="373" width="0.1" height="15.0" fill="rgb(243,73,49)" rx="2" ry="2" />
+<text  x="13.00" y="383.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_insert (16 samples, 0.14%)</title><rect x="1185.7" y="293" width="1.6" height="15.0" fill="rgb(220,202,34)" rx="2" ry="2" />
+<text  x="1188.68" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_alloc (12 samples, 0.10%)</title><rect x="81.8" y="293" width="1.2" height="15.0" fill="rgb(241,148,43)" rx="2" ry="2" />
+<text  x="84.79" y="303.5" ></text>
+</g>
+<g >
+<title>__close_nocancel (1,623 samples, 13.81%)</title><rect x="732.6" y="261" width="163.0" height="15.0" fill="rgb(253,202,25)" rx="2" ry="2" />
+<text  x="735.64" y="271.5" >__close_nocancel</text>
+</g>
+<g >
+<title>ngx_http_lua_capture_body_filter (2 samples, 0.02%)</title><rect x="1189.8" y="453" width="0.2" height="15.0" fill="rgb(241,74,30)" rx="2" ry="2" />
+<text  x="1192.80" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (2 samples, 0.02%)</title><rect x="185.2" y="197" width="0.2" height="15.0" fill="rgb(253,169,19)" rx="2" ry="2" />
+<text  x="188.21" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_create_request (85 samples, 0.72%)</title><rect x="72.6" y="309" width="8.5" height="15.0" fill="rgb(217,154,6)" rx="2" ry="2" />
+<text  x="75.55" y="319.5" ></text>
+</g>
+<g >
+<title>__errno_location (7 samples, 0.06%)</title><rect x="71.9" y="309" width="0.7" height="15.0" fill="rgb(219,67,22)" rx="2" ry="2" />
+<text  x="74.85" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_hash_find (12 samples, 0.10%)</title><rect x="192.6" y="197" width="1.2" height="15.0" fill="rgb(231,145,4)" rx="2" ry="2" />
+<text  x="195.64" y="207.5" ></text>
+</g>
+<g >
+<title>lj_tab_new (11 samples, 0.09%)</title><rect x="24.7" y="453" width="1.1" height="15.0" fill="rgb(228,47,41)" rx="2" ry="2" />
+<text  x="27.66" y="463.5" ></text>
+</g>
+<g >
+<title>_init (5 samples, 0.04%)</title><rect x="147.3" y="197" width="0.5" height="15.0" fill="rgb(207,108,29)" rx="2" ry="2" />
+<text  x="150.26" y="207.5" ></text>
+</g>
+<g >
+<title>lj_mem_realloc (14 samples, 0.12%)</title><rect x="156.7" y="165" width="1.4" height="15.0" fill="rgb(232,108,43)" rx="2" ry="2" />
+<text  x="159.70" y="175.5" ></text>
+</g>
+<g >
+<title>lj_state_free (3 samples, 0.03%)</title><rect x="18.4" y="389" width="0.3" height="15.0" fill="rgb(239,226,9)" rx="2" ry="2" />
+<text  x="21.43" y="399.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_process_content_length (8 samples, 0.07%)</title><rect x="632.5" y="277" width="0.8" height="15.0" fill="rgb(218,109,16)" rx="2" ry="2" />
+<text  x="635.53" y="287.5" ></text>
+</g>
+<g >
+<title>lj_vm_pcall (4 samples, 0.03%)</title><rect x="454.7" y="133" width="0.4" height="15.0" fill="rgb(210,50,52)" rx="2" ry="2" />
+<text  x="457.71" y="143.5" ></text>
+</g>
+<g >
+<title>lj_alloc_free (3 samples, 0.03%)</title><rect x="18.4" y="373" width="0.3" height="15.0" fill="rgb(252,119,46)" rx="2" ry="2" />
+<text  x="21.43" y="383.5" ></text>
+</g>
+<g >
+<title>ngx_handle_read_event (1 samples, 0.01%)</title><rect x="1021.0" y="277" width="0.1" height="15.0" fill="rgb(214,221,22)" rx="2" ry="2" />
+<text  x="1024.01" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_proxy_process_status_line (25 samples, 0.21%)</title><rect x="634.6" y="293" width="2.6" height="15.0" fill="rgb(243,156,45)" rx="2" ry="2" />
+<text  x="637.64" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_insert (6 samples, 0.05%)</title><rect x="1189.2" y="389" width="0.6" height="15.0" fill="rgb(228,143,32)" rx="2" ry="2" />
+<text  x="1192.20" y="399.5" ></text>
+</g>
+<g >
+<title>lua_remove (7 samples, 0.06%)</title><rect x="461.6" y="149" width="0.7" height="15.0" fill="rgb(234,72,29)" rx="2" ry="2" />
+<text  x="464.64" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_ffi_balancer_set_current_peer (30 samples, 0.26%)</title><rect x="27.5" y="453" width="3.0" height="15.0" fill="rgb(248,35,23)" rx="2" ry="2" />
+<text  x="30.47" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_create_temp_buf (5 samples, 0.04%)</title><rect x="192.1" y="197" width="0.5" height="15.0" fill="rgb(235,73,17)" rx="2" ry="2" />
+<text  x="195.14" y="207.5" ></text>
+</g>
+<g >
+<title>_int_free (13 samples, 0.11%)</title><rect x="713.6" y="245" width="1.3" height="15.0" fill="rgb(243,0,3)" rx="2" ry="2" />
+<text  x="716.56" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_vslprintf (15 samples, 0.13%)</title><rect x="28.7" y="405" width="1.5" height="15.0" fill="rgb(228,13,18)" rx="2" ry="2" />
+<text  x="31.68" y="415.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0c2ea (3 samples, 0.03%)</title><rect x="26.6" y="469" width="0.3" height="15.0" fill="rgb(251,148,19)" rx="2" ry="2" />
+<text  x="29.57" y="479.5" ></text>
+</g>
+<g >
+<title>json_decode (2 samples, 0.02%)</title><rect x="128.4" y="197" width="0.2" height="15.0" fill="rgb(223,19,51)" rx="2" ry="2" />
+<text  x="131.38" y="207.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0cc3f (2 samples, 0.02%)</title><rect x="31.3" y="469" width="0.2" height="15.0" fill="rgb(220,86,39)" rx="2" ry="2" />
+<text  x="34.29" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_pnalloc (2 samples, 0.02%)</title><rect x="33.7" y="421" width="0.2" height="15.0" fill="rgb(237,35,23)" rx="2" ry="2" />
+<text  x="36.70" y="431.5" ></text>
+</g>
+<g >
+<title>lj_meta_tget (30 samples, 0.26%)</title><rect x="455.9" y="117" width="3.0" height="15.0" fill="rgb(228,24,22)" rx="2" ry="2" />
+<text  x="458.91" y="127.5" ></text>
+</g>
+<g >
+<title>gc_onestep (2 samples, 0.02%)</title><rect x="1189.0" y="421" width="0.2" height="15.0" fill="rgb(210,173,29)" rx="2" ry="2" />
+<text  x="1192.00" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_http_process_request_headers (4,470 samples, 38.04%)</title><rect x="136.4" y="309" width="448.8" height="15.0" fill="rgb(208,149,16)" rx="2" ry="2" />
+<text  x="139.41" y="319.5" >ngx_http_process_request_headers</text>
+</g>
+<g >
+<title>ngx_http_script_copy_var_code (6 samples, 0.05%)</title><rect x="196.8" y="197" width="0.6" height="15.0" fill="rgb(225,109,31)" rx="2" ry="2" />
+<text  x="199.76" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_start_worker_processes (11,459 samples, 97.51%)</title><rect x="38.4" y="405" width="1150.6" height="15.0" fill="rgb(211,118,47)" rx="2" ry="2" />
+<text  x="41.42" y="415.5" >ngx_start_worker_processes</text>
+</g>
+<g >
+<title>lua_rawseti (4 samples, 0.03%)</title><rect x="719.3" y="229" width="0.4" height="15.0" fill="rgb(254,205,20)" rx="2" ry="2" />
+<text  x="722.29" y="239.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0cd25 (2 samples, 0.02%)</title><rect x="31.7" y="469" width="0.2" height="15.0" fill="rgb(230,17,26)" rx="2" ry="2" />
+<text  x="34.69" y="479.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (31 samples, 0.26%)</title><rect x="616.6" y="277" width="3.1" height="15.0" fill="rgb(242,188,46)" rx="2" ry="2" />
+<text  x="619.57" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (4 samples, 0.03%)</title><rect x="1018.9" y="245" width="0.4" height="15.0" fill="rgb(247,109,1)" rx="2" ry="2" />
+<text  x="1021.90" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_http_parse_header_line (75 samples, 0.64%)</title><rect x="624.6" y="277" width="7.5" height="15.0" fill="rgb(252,69,51)" rx="2" ry="2" />
+<text  x="627.60" y="287.5" ></text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="904.3" y="37" width="0.2" height="15.0" fill="rgb(240,34,39)" rx="2" ry="2" />
+<text  x="907.34" y="47.5" ></text>
+</g>
+<g >
+<title>ngx_http_header_filter (65 samples, 0.55%)</title><rect x="603.8" y="229" width="6.5" height="15.0" fill="rgb(250,33,22)" rx="2" ry="2" />
+<text  x="606.82" y="239.5" ></text>
+</g>
+<g >
+<title>_int_malloc (6 samples, 0.05%)</title><rect x="75.7" y="229" width="0.6" height="15.0" fill="rgb(216,148,26)" rx="2" ry="2" />
+<text  x="78.67" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (1 samples, 0.01%)</title><rect x="608.0" y="181" width="0.1" height="15.0" fill="rgb(249,139,53)" rx="2" ry="2" />
+<text  x="611.03" y="191.5" ></text>
+</g>
+<g >
+<title>gc_traverse_trace.part.3 (11 samples, 0.09%)</title><rect x="23.6" y="405" width="1.1" height="15.0" fill="rgb(253,0,0)" rx="2" ry="2" />
+<text  x="26.56" y="415.5" ></text>
+</g>
+<g >
+<title>lua_rawseti (11 samples, 0.09%)</title><rect x="148.3" y="197" width="1.1" height="15.0" fill="rgb(207,126,17)" rx="2" ry="2" />
+<text  x="151.26" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_addition_body_filter (20 samples, 0.17%)</title><rect x="1024.4" y="165" width="2.0" height="15.0" fill="rgb(215,154,12)" rx="2" ry="2" />
+<text  x="1027.43" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_socket_tcp_resume_helper (2 samples, 0.02%)</title><rect x="128.4" y="293" width="0.2" height="15.0" fill="rgb(236,38,42)" rx="2" ry="2" />
+<text  x="131.38" y="303.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0d1ac (1 samples, 0.01%)</title><rect x="35.2" y="469" width="0.1" height="15.0" fill="rgb(225,187,17)" rx="2" ry="2" />
+<text  x="38.20" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_palloc_large (14 samples, 0.12%)</title><rect x="644.0" y="293" width="1.4" height="15.0" fill="rgb(233,70,16)" rx="2" ry="2" />
+<text  x="646.98" y="303.5" ></text>
+</g>
+<g >
+<title>hashkey.isra.0 (6 samples, 0.05%)</title><rect x="450.6" y="101" width="0.6" height="15.0" fill="rgb(234,54,32)" rx="2" ry="2" />
+<text  x="453.59" y="111.5" ></text>
+</g>
+<g >
+<title>epoll_ctl (455 samples, 3.87%)</title><rect x="372.6" y="165" width="45.7" height="15.0" fill="rgb(224,151,32)" rx="2" ry="2" />
+<text  x="375.57" y="175.5" >epol..</text>
+</g>
+<g >
+<title>__libc_malloc (10 samples, 0.09%)</title><rect x="203.0" y="149" width="1.0" height="15.0" fill="rgb(234,145,11)" rx="2" ry="2" />
+<text  x="205.99" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_http_range_body_filter (6 samples, 0.05%)</title><rect x="1026.5" y="245" width="0.6" height="15.0" fill="rgb(210,207,3)" rx="2" ry="2" />
+<text  x="1029.54" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_event_expire_timers (2 samples, 0.02%)</title><rect x="1188.8" y="341" width="0.2" height="15.0" fill="rgb(244,42,12)" rx="2" ry="2" />
+<text  x="1191.80" y="351.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0c550 (2 samples, 0.02%)</title><rect x="27.3" y="469" width="0.2" height="15.0" fill="rgb(231,215,53)" rx="2" ry="2" />
+<text  x="30.27" y="479.5" ></text>
+</g>
+<g >
+<title>lj_BC_ISGE (2 samples, 0.02%)</title><rect x="430.6" y="133" width="0.2" height="15.0" fill="rgb(224,209,22)" rx="2" ry="2" />
+<text  x="433.61" y="143.5" ></text>
+</g>
+<g >
+<title>lj_BC_KSTR (5 samples, 0.04%)</title><rect x="163.3" y="213" width="0.5" height="15.0" fill="rgb(254,45,33)" rx="2" ry="2" />
+<text  x="166.32" y="223.5" ></text>
+</g>
+<g >
+<title>epoll_ctl (5 samples, 0.04%)</title><rect x="69.0" y="261" width="0.5" height="15.0" fill="rgb(214,153,17)" rx="2" ry="2" />
+<text  x="72.04" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_epoll_add_event (5 samples, 0.04%)</title><rect x="183.3" y="213" width="0.5" height="15.0" fill="rgb(229,16,26)" rx="2" ry="2" />
+<text  x="186.30" y="223.5" ></text>
+</g>
+<g >
+<title>index2adr (2 samples, 0.02%)</title><rect x="170.4" y="181" width="0.2" height="15.0" fill="rgb(230,143,54)" rx="2" ry="2" />
+<text  x="173.35" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_linux_sendfile_chain (2 samples, 0.02%)</title><rect x="1189.8" y="309" width="0.2" height="15.0" fill="rgb(209,136,30)" rx="2" ry="2" />
+<text  x="1192.80" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_output_chain (30 samples, 0.26%)</title><rect x="1023.4" y="229" width="3.0" height="15.0" fill="rgb(234,51,9)" rx="2" ry="2" />
+<text  x="1026.42" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_http_proxy_internal_body_length_variable (2 samples, 0.02%)</title><rect x="199.8" y="165" width="0.2" height="15.0" fill="rgb(245,197,51)" rx="2" ry="2" />
+<text  x="202.77" y="175.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0d22b (5 samples, 0.04%)</title><rect x="35.3" y="469" width="0.5" height="15.0" fill="rgb(224,174,48)" rx="2" ry="2" />
+<text  x="38.30" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_output_filter (1,182 samples, 10.06%)</title><rect x="900.0" y="261" width="118.7" height="15.0" fill="rgb(227,181,45)" rx="2" ry="2" />
+<text  x="903.02" y="271.5" >ngx_http_outpu..</text>
+</g>
+<g >
+<title>ngx_pcalloc (1 samples, 0.01%)</title><rect x="608.0" y="197" width="0.1" height="15.0" fill="rgb(253,223,36)" rx="2" ry="2" />
+<text  x="611.03" y="207.5" ></text>
+</g>
+<g >
+<title>__libc_malloc (12 samples, 0.10%)</title><rect x="81.8" y="277" width="1.2" height="15.0" fill="rgb(234,128,19)" rx="2" ry="2" />
+<text  x="84.79" y="287.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (6 samples, 0.05%)</title><rect x="138.0" y="293" width="0.6" height="15.0" fill="rgb(210,202,47)" rx="2" ry="2" />
+<text  x="141.02" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_http_ssi_body_filter (2 samples, 0.02%)</title><rect x="1189.8" y="373" width="0.2" height="15.0" fill="rgb(210,103,36)" rx="2" ry="2" />
+<text  x="1192.80" y="383.5" ></text>
+</g>
+<g >
+<title>ngx_http_proxy_copy_filter (4 samples, 0.03%)</title><rect x="1021.9" y="277" width="0.4" height="15.0" fill="rgb(219,178,7)" rx="2" ry="2" />
+<text  x="1024.92" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_vslprintf (11 samples, 0.09%)</title><rect x="34.1" y="405" width="1.1" height="15.0" fill="rgb(254,1,14)" rx="2" ry="2" />
+<text  x="37.10" y="415.5" ></text>
+</g>
+<g >
+<title>__libc_malloc (4 samples, 0.03%)</title><rect x="607.6" y="149" width="0.4" height="15.0" fill="rgb(212,133,47)" rx="2" ry="2" />
+<text  x="610.63" y="159.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0cad4 (1 samples, 0.01%)</title><rect x="31.0" y="469" width="0.1" height="15.0" fill="rgb(254,5,51)" rx="2" ry="2" />
+<text  x="33.99" y="479.5" ></text>
+</g>
+<g >
+<title>lj_cont_dispatch (4 samples, 0.03%)</title><rect x="449.5" y="133" width="0.4" height="15.0" fill="rgb(214,220,33)" rx="2" ry="2" />
+<text  x="452.49" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_send_special (1,190 samples, 10.13%)</title><rect x="899.8" y="277" width="119.5" height="15.0" fill="rgb(219,182,38)" rx="2" ry="2" />
+<text  x="902.82" y="287.5" >ngx_http_send_..</text>
+</g>
+<g >
+<title>ngx_create_temp_buf (11 samples, 0.09%)</title><rect x="607.0" y="213" width="1.1" height="15.0" fill="rgb(206,10,36)" rx="2" ry="2" />
+<text  x="610.03" y="223.5" ></text>
+</g>
+<g >
+<title>lj_BC_JLOOP (39 samples, 0.33%)</title><rect x="431.3" y="133" width="3.9" height="15.0" fill="rgb(227,77,10)" rx="2" ry="2" />
+<text  x="434.31" y="143.5" ></text>
+</g>
+<g >
+<title>lua_pcall (2 samples, 0.02%)</title><rect x="128.4" y="229" width="0.2" height="15.0" fill="rgb(226,61,34)" rx="2" ry="2" />
+<text  x="131.38" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_cache_loadbuffer (67 samples, 0.57%)</title><rect x="171.4" y="229" width="6.7" height="15.0" fill="rgb(243,227,26)" rx="2" ry="2" />
+<text  x="174.36" y="239.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0c106 (4 samples, 0.03%)</title><rect x="26.2" y="469" width="0.4" height="15.0" fill="rgb(232,146,40)" rx="2" ry="2" />
+<text  x="29.17" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_auth_basic_handler (4 samples, 0.03%)</title><rect x="142.7" y="261" width="0.4" height="15.0" fill="rgb(207,77,16)" rx="2" ry="2" />
+<text  x="145.74" y="271.5" ></text>
+</g>
+<g >
+<title>lj_alloc_f (4 samples, 0.03%)</title><rect x="151.9" y="165" width="0.4" height="15.0" fill="rgb(243,13,15)" rx="2" ry="2" />
+<text  x="154.88" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_capture_body_filter (1 samples, 0.01%)</title><rect x="10.0" y="437" width="0.1" height="15.0" fill="rgb(207,161,7)" rx="2" ry="2" />
+<text  x="13.00" y="447.5" ></text>
+</g>
+<g >
+<title>ngx_palloc_large (17 samples, 0.14%)</title><rect x="81.3" y="309" width="1.7" height="15.0" fill="rgb(228,185,2)" rx="2" ry="2" />
+<text  x="84.29" y="319.5" ></text>
+</g>
+<g >
+<title>lj_str_new (15 samples, 0.13%)</title><rect x="717.2" y="213" width="1.5" height="15.0" fill="rgb(236,171,45)" rx="2" ry="2" />
+<text  x="720.18" y="223.5" ></text>
+</g>
+<g >
+<title>posix_memalign (7 samples, 0.06%)</title><rect x="586.1" y="277" width="0.7" height="15.0" fill="rgb(230,100,19)" rx="2" ry="2" />
+<text  x="589.14" y="287.5" ></text>
+</g>
+<g >
+<title>lj_mem_realloc (4 samples, 0.03%)</title><rect x="25.4" y="421" width="0.4" height="15.0" fill="rgb(235,7,18)" rx="2" ry="2" />
+<text  x="28.36" y="431.5" ></text>
+</g>
+<g >
+<title>posix_memalign (16 samples, 0.14%)</title><rect x="202.4" y="165" width="1.6" height="15.0" fill="rgb(229,178,28)" rx="2" ry="2" />
+<text  x="205.38" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_trailers_filter (2 samples, 0.02%)</title><rect x="1189.8" y="437" width="0.2" height="15.0" fill="rgb(225,132,49)" rx="2" ry="2" />
+<text  x="1192.80" y="447.5" ></text>
+</g>
+<g >
+<title>lj_state_new (69 samples, 0.59%)</title><rect x="151.2" y="197" width="6.9" height="15.0" fill="rgb(228,146,39)" rx="2" ry="2" />
+<text  x="154.17" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_linux_sendfile_chain (1 samples, 0.01%)</title><rect x="10.0" y="293" width="0.1" height="15.0" fill="rgb(206,228,12)" rx="2" ry="2" />
+<text  x="13.00" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_http_gunzip_body_filter (1 samples, 0.01%)</title><rect x="10.0" y="405" width="0.1" height="15.0" fill="rgb(241,140,7)" rx="2" ry="2" />
+<text  x="13.00" y="415.5" ></text>
+</g>
+<g >
+<title>ngx_palloc_block (7 samples, 0.06%)</title><rect x="586.1" y="309" width="0.7" height="15.0" fill="rgb(226,75,33)" rx="2" ry="2" />
+<text  x="589.14" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_http_finalize_request (16 samples, 0.14%)</title><rect x="727.9" y="293" width="1.6" height="15.0" fill="rgb(236,147,38)" rx="2" ry="2" />
+<text  x="730.92" y="303.5" ></text>
+</g>
+<g >
+<title>_init (1 samples, 0.01%)</title><rect x="713.5" y="245" width="0.1" height="15.0" fill="rgb(211,14,52)" rx="2" ry="2" />
+<text  x="716.46" y="255.5" ></text>
+</g>
+<g >
+<title>writev (964 samples, 8.20%)</title><rect x="1087.0" y="229" width="96.8" height="15.0" fill="rgb(228,37,30)" rx="2" ry="2" />
+<text  x="1089.98" y="239.5" >writev</text>
+</g>
+<g >
+<title>lj_alloc_malloc (4 samples, 0.03%)</title><rect x="25.4" y="405" width="0.4" height="15.0" fill="rgb(227,72,13)" rx="2" ry="2" />
+<text  x="28.36" y="415.5" ></text>
+</g>
+<g >
+<title>ngx_linux_sendfile_chain (1,159 samples, 9.86%)</title><rect x="902.3" y="69" width="116.4" height="15.0" fill="rgb(225,28,25)" rx="2" ry="2" />
+<text  x="905.33" y="79.5" >ngx_linux_send..</text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="585.9" y="309" width="0.2" height="15.0" fill="rgb(222,154,20)" rx="2" ry="2" />
+<text  x="588.94" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_http_not_modified_header_filter (5 samples, 0.04%)</title><rect x="612.6" y="293" width="0.5" height="15.0" fill="rgb(218,150,36)" rx="2" ry="2" />
+<text  x="615.55" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_pcre_malloc_init (2 samples, 0.02%)</title><rect x="170.6" y="213" width="0.2" height="15.0" fill="rgb(233,118,21)" rx="2" ry="2" />
+<text  x="173.55" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_limit_conn_handler (12 samples, 0.10%)</title><rect x="573.0" y="261" width="1.2" height="15.0" fill="rgb(229,13,49)" rx="2" ry="2" />
+<text  x="575.99" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_chain_writer (987 samples, 8.40%)</title><rect x="1085.6" y="277" width="99.1" height="15.0" fill="rgb(238,22,11)" rx="2" ry="2" />
+<text  x="1088.58" y="287.5" >ngx_chain_w..</text>
+</g>
+<g >
+<title>ngx_http_lua_access_handler_inline (73 samples, 0.62%)</title><rect x="170.8" y="245" width="7.3" height="15.0" fill="rgb(210,116,13)" rx="2" ry="2" />
+<text  x="173.75" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_atoi (2 samples, 0.02%)</title><rect x="633.1" y="261" width="0.2" height="15.0" fill="rgb(231,138,8)" rx="2" ry="2" />
+<text  x="636.13" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_sprintf_num (2 samples, 0.02%)</title><rect x="35.0" y="389" width="0.2" height="15.0" fill="rgb(205,127,36)" rx="2" ry="2" />
+<text  x="38.00" y="399.5" ></text>
+</g>
+<g >
+<title>ngx_output_chain (1,007 samples, 8.57%)</title><rect x="1083.6" y="293" width="101.1" height="15.0" fill="rgb(245,44,15)" rx="2" ry="2" />
+<text  x="1086.57" y="303.5" >ngx_output_c..</text>
+</g>
+<g >
+<title>0x7ff0fdd0a064 (1 samples, 0.01%)</title><rect x="10.4" y="469" width="0.1" height="15.0" fill="rgb(232,88,21)" rx="2" ry="2" />
+<text  x="13.40" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_cache_load_code.isra.0 (56 samples, 0.48%)</title><rect x="172.5" y="213" width="5.6" height="15.0" fill="rgb(236,151,17)" rx="2" ry="2" />
+<text  x="175.46" y="223.5" ></text>
+</g>
+<g >
+<title>readv (329 samples, 2.80%)</title><rect x="1027.8" y="261" width="33.1" height="15.0" fill="rgb(226,111,18)" rx="2" ry="2" />
+<text  x="1030.84" y="271.5" >re..</text>
+</g>
+<g >
+<title>lj_tab_setinth (4 samples, 0.03%)</title><rect x="169.7" y="165" width="0.5" height="15.0" fill="rgb(239,81,30)" rx="2" ry="2" />
+<text  x="172.75" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_parse_url (26 samples, 0.22%)</title><rect x="32.6" y="437" width="2.6" height="15.0" fill="rgb(244,18,44)" rx="2" ry="2" />
+<text  x="35.59" y="447.5" ></text>
+</g>
+<g >
+<title>lua_rawseti (4 samples, 0.03%)</title><rect x="169.7" y="181" width="0.5" height="15.0" fill="rgb(218,83,29)" rx="2" ry="2" />
+<text  x="172.75" y="191.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0c58e (30 samples, 0.26%)</title><rect x="27.5" y="469" width="3.0" height="15.0" fill="rgb(222,112,30)" rx="2" ry="2" />
+<text  x="30.47" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_send_request_handler (6 samples, 0.05%)</title><rect x="1187.3" y="309" width="0.6" height="15.0" fill="rgb(217,198,21)" rx="2" ry="2" />
+<text  x="1190.29" y="319.5" ></text>
+</g>
+<g >
+<title>0x7ff0cc396e00 (1 samples, 0.01%)</title><rect x="10.0" y="469" width="0.1" height="15.0" fill="rgb(220,51,1)" rx="2" ry="2" />
+<text  x="13.00" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_wait_request_handler (9 samples, 0.08%)</title><rect x="1187.9" y="325" width="0.9" height="15.0" fill="rgb(211,46,44)" rx="2" ry="2" />
+<text  x="1190.89" y="335.5" ></text>
+</g>
+<g >
+<title>ngx_writev.part.0 (2 samples, 0.02%)</title><rect x="1189.8" y="293" width="0.2" height="15.0" fill="rgb(212,97,37)" rx="2" ry="2" />
+<text  x="1192.80" y="303.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (2 samples, 0.02%)</title><rect x="35.0" y="373" width="0.2" height="15.0" fill="rgb(244,156,51)" rx="2" ry="2" />
+<text  x="38.00" y="383.5" ></text>
+</g>
+<g >
+<title>ngx_http_realip_handler (6 samples, 0.05%)</title><rect x="574.9" y="261" width="0.6" height="15.0" fill="rgb(226,135,13)" rx="2" ry="2" />
+<text  x="577.90" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_hash_find (49 samples, 0.42%)</title><rect x="619.7" y="277" width="4.9" height="15.0" fill="rgb(238,78,9)" rx="2" ry="2" />
+<text  x="622.68" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_memalign (6 samples, 0.05%)</title><rect x="1189.2" y="373" width="0.6" height="15.0" fill="rgb(208,48,9)" rx="2" ry="2" />
+<text  x="1192.20" y="383.5" ></text>
+</g>
+<g >
+<title>ngx_readv_chain (336 samples, 2.86%)</title><rect x="1027.1" y="277" width="33.8" height="15.0" fill="rgb(253,58,4)" rx="2" ry="2" />
+<text  x="1030.14" y="287.5" >ng..</text>
+</g>
+<g >
+<title>lj_tab_get (8 samples, 0.07%)</title><rect x="174.0" y="165" width="0.8" height="15.0" fill="rgb(222,163,51)" rx="2" ry="2" />
+<text  x="176.97" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_chain_update_sent (12 samples, 0.10%)</title><rect x="902.3" y="53" width="1.2" height="15.0" fill="rgb(234,108,35)" rx="2" ry="2" />
+<text  x="905.33" y="63.5" ></text>
+</g>
+<g >
+<title>lua_getfield (33 samples, 0.28%)</title><rect x="172.7" y="197" width="3.3" height="15.0" fill="rgb(230,4,36)" rx="2" ry="2" />
+<text  x="175.66" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_cache_loadbuffer (16 samples, 0.14%)</title><rect x="463.0" y="149" width="1.6" height="15.0" fill="rgb(232,122,13)" rx="2" ry="2" />
+<text  x="466.04" y="159.5" ></text>
+</g>
+<g >
+<title>json_next_token (2 samples, 0.02%)</title><rect x="128.4" y="149" width="0.2" height="15.0" fill="rgb(254,207,6)" rx="2" ry="2" />
+<text  x="131.38" y="159.5" ></text>
+</g>
+<g >
+<title>lua_newthread (75 samples, 0.64%)</title><rect x="150.6" y="213" width="7.5" height="15.0" fill="rgb(219,154,54)" rx="2" ry="2" />
+<text  x="153.57" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_access_by_chunk (258 samples, 2.20%)</title><rect x="144.8" y="245" width="26.0" height="15.0" fill="rgb(217,22,45)" rx="2" ry="2" />
+<text  x="147.85" y="255.5" >n..</text>
+</g>
+<g >
+<title>ngx_http_sub_header_filter (5 samples, 0.04%)</title><rect x="610.5" y="261" width="0.5" height="15.0" fill="rgb(248,24,39)" rx="2" ry="2" />
+<text  x="613.54" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_strncasecmp.part.2 (1 samples, 0.01%)</title><rect x="30.4" y="421" width="0.1" height="15.0" fill="rgb(241,13,46)" rx="2" ry="2" />
+<text  x="33.38" y="431.5" ></text>
+</g>
+<g >
+<title>getsockopt (196 samples, 1.67%)</title><rect x="1063.9" y="277" width="19.7" height="15.0" fill="rgb(210,155,45)" rx="2" ry="2" />
+<text  x="1066.89" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_core_find_config_phase (29 samples, 0.25%)</title><rect x="569.8" y="277" width="2.9" height="15.0" fill="rgb(248,17,0)" rx="2" ry="2" />
+<text  x="572.78" y="287.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (2 samples, 0.02%)</title><rect x="34.8" y="389" width="0.2" height="15.0" fill="rgb(230,29,17)" rx="2" ry="2" />
+<text  x="37.80" y="399.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_ffi_now (7 samples, 0.06%)</title><rect x="37.0" y="453" width="0.7" height="15.0" fill="rgb(238,200,6)" rx="2" ry="2" />
+<text  x="40.01" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_http_charset_header_filter (83 samples, 0.71%)</title><rect x="602.0" y="261" width="8.3" height="15.0" fill="rgb(227,220,4)" rx="2" ry="2" />
+<text  x="605.01" y="271.5" ></text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="172.5" y="197" width="0.2" height="15.0" fill="rgb(246,174,46)" rx="2" ry="2" />
+<text  x="175.46" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_memalign (1 samples, 0.01%)</title><rect x="1187.9" y="277" width="0.1" height="15.0" fill="rgb(227,123,18)" rx="2" ry="2" />
+<text  x="1190.89" y="287.5" ></text>
+</g>
+<g >
+<title>lj_ff_next (11 samples, 0.09%)</title><rect x="450.3" y="133" width="1.1" height="15.0" fill="rgb(251,149,39)" rx="2" ry="2" />
+<text  x="453.29" y="143.5" ></text>
+</g>
+<g >
+<title>recv (3 samples, 0.03%)</title><rect x="128.6" y="277" width="0.3" height="15.0" fill="rgb(214,189,48)" rx="2" ry="2" />
+<text  x="131.58" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (5 samples, 0.04%)</title><rect x="645.4" y="293" width="0.5" height="15.0" fill="rgb(234,221,16)" rx="2" ry="2" />
+<text  x="648.38" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_delete (10 samples, 0.09%)</title><rect x="1184.7" y="293" width="1.0" height="15.0" fill="rgb(247,163,2)" rx="2" ry="2" />
+<text  x="1187.68" y="303.5" ></text>
+</g>
+<g >
+<title>gc_traverse_trace.part.3 (2 samples, 0.02%)</title><rect x="461.4" y="101" width="0.2" height="15.0" fill="rgb(225,110,20)" rx="2" ry="2" />
+<text  x="464.44" y="111.5" ></text>
+</g>
+<g >
+<title>lj_str_new (12 samples, 0.10%)</title><rect x="174.8" y="181" width="1.2" height="15.0" fill="rgb(218,121,18)" rx="2" ry="2" />
+<text  x="177.77" y="191.5" ></text>
+</g>
+<g >
+<title>lj_tab_setinth (2 samples, 0.02%)</title><rect x="149.2" y="181" width="0.2" height="15.0" fill="rgb(218,41,0)" rx="2" ry="2" />
+<text  x="152.17" y="191.5" ></text>
+</g>
+<g >
+<title>lj_BC_TGETS (9 samples, 0.08%)</title><rect x="163.8" y="213" width="0.9" height="15.0" fill="rgb(245,126,23)" rx="2" ry="2" />
+<text  x="166.83" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_proxy_handler (6 samples, 0.05%)</title><rect x="1189.2" y="453" width="0.6" height="15.0" fill="rgb(249,17,18)" rx="2" ry="2" />
+<text  x="1192.20" y="463.5" ></text>
+</g>
+<g >
+<title>lj_strscan_scan (2 samples, 0.02%)</title><rect x="27.1" y="437" width="0.2" height="15.0" fill="rgb(235,14,24)" rx="2" ry="2" />
+<text  x="30.07" y="447.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0cc76 (2 samples, 0.02%)</title><rect x="31.5" y="469" width="0.2" height="15.0" fill="rgb(226,152,21)" rx="2" ry="2" />
+<text  x="34.49" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_access_handler (362 samples, 3.08%)</title><rect x="143.1" y="261" width="36.4" height="15.0" fill="rgb(218,139,5)" rx="2" ry="2" />
+<text  x="146.14" y="271.5" >ngx..</text>
+</g>
+<g >
+<title>ngx_http_variable_remote_addr (2 samples, 0.02%)</title><rect x="200.4" y="165" width="0.2" height="15.0" fill="rgb(218,204,40)" rx="2" ry="2" />
+<text  x="203.37" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_connect (3,632 samples, 30.91%)</title><rect x="201.5" y="213" width="364.7" height="15.0" fill="rgb(250,137,52)" rx="2" ry="2" />
+<text  x="204.48" y="223.5" >ngx_http_upstream_connect</text>
+</g>
+<g >
+<title>ngx_http_get_indexed_variable (24 samples, 0.20%)</title><rect x="198.2" y="181" width="2.4" height="15.0" fill="rgb(227,103,36)" rx="2" ry="2" />
+<text  x="201.17" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_http_write_filter (1,170 samples, 9.96%)</title><rect x="901.2" y="85" width="117.5" height="15.0" fill="rgb(232,193,30)" rx="2" ry="2" />
+<text  x="904.23" y="95.5" >ngx_http_write..</text>
+</g>
+<g >
+<title>lj_BC_JFUNCF (5 samples, 0.04%)</title><rect x="430.8" y="133" width="0.5" height="15.0" fill="rgb(244,1,8)" rx="2" ry="2" />
+<text  x="433.81" y="143.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0d343 (3 samples, 0.03%)</title><rect x="36.2" y="469" width="0.3" height="15.0" fill="rgb(249,40,45)" rx="2" ry="2" />
+<text  x="39.21" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_process_upstream (421 samples, 3.58%)</title><rect x="1019.3" y="309" width="42.3" height="15.0" fill="rgb(254,67,48)" rx="2" ry="2" />
+<text  x="1022.31" y="319.5" >ngx..</text>
+</g>
+<g >
+<title>ngx_http_lua_capture_body_filter (1,178 samples, 10.02%)</title><rect x="900.4" y="213" width="118.3" height="15.0" fill="rgb(250,84,42)" rx="2" ry="2" />
+<text  x="903.42" y="223.5" >ngx_http_lua_c..</text>
+</g>
+<g >
+<title>lua_setexdata (2 samples, 0.02%)</title><rect x="462.3" y="149" width="0.2" height="15.0" fill="rgb(210,63,1)" rx="2" ry="2" />
+<text  x="465.34" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_http_postpone_filter (10 samples, 0.09%)</title><rect x="1025.4" y="117" width="1.0" height="15.0" fill="rgb(236,146,12)" rx="2" ry="2" />
+<text  x="1028.43" y="127.5" ></text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="173.8" y="181" width="0.2" height="15.0" fill="rgb(218,27,30)" rx="2" ry="2" />
+<text  x="176.77" y="191.5" ></text>
+</g>
+<g >
+<title>json_process_value (2 samples, 0.02%)</title><rect x="128.4" y="165" width="0.2" height="15.0" fill="rgb(243,31,54)" rx="2" ry="2" />
+<text  x="131.38" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_socket_tcp_handler (5 samples, 0.04%)</title><rect x="128.4" y="325" width="0.5" height="15.0" fill="rgb(249,110,26)" rx="2" ry="2" />
+<text  x="131.38" y="335.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_balancer_handler_inline (19 samples, 0.16%)</title><rect x="462.7" y="165" width="1.9" height="15.0" fill="rgb(241,118,32)" rx="2" ry="2" />
+<text  x="465.74" y="175.5" ></text>
+</g>
+<g >
+<title>lj_BC_JLOOP (8 samples, 0.07%)</title><rect x="162.5" y="213" width="0.8" height="15.0" fill="rgb(230,165,39)" rx="2" ry="2" />
+<text  x="165.52" y="223.5" ></text>
+</g>
+<g >
+<title>gc_onestep (76 samples, 0.65%)</title><rect x="12.2" y="421" width="7.6" height="15.0" fill="rgb(206,164,32)" rx="2" ry="2" />
+<text  x="15.21" y="431.5" ></text>
+</g>
+<g >
+<title>socket (776 samples, 6.60%)</title><rect x="483.6" y="181" width="77.9" height="15.0" fill="rgb(224,209,48)" rx="2" ry="2" />
+<text  x="486.63" y="191.5" >socket</text>
+</g>
+<g >
+<title>ngx_list_push (2 samples, 0.02%)</title><rect x="583.8" y="293" width="0.2" height="15.0" fill="rgb(226,43,11)" rx="2" ry="2" />
+<text  x="586.83" y="303.5" ></text>
+</g>
+<g >
+<title>lua_xmove (2 samples, 0.02%)</title><rect x="146.0" y="229" width="0.2" height="15.0" fill="rgb(229,19,40)" rx="2" ry="2" />
+<text  x="148.95" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="28.5" y="405" width="0.2" height="15.0" fill="rgb(208,19,34)" rx="2" ry="2" />
+<text  x="31.48" y="415.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="76.3" y="293" width="0.2" height="15.0" fill="rgb(219,220,42)" rx="2" ry="2" />
+<text  x="79.27" y="303.5" ></text>
+</g>
+<g >
+<title>lj_tab_getstr (10 samples, 0.09%)</title><rect x="457.9" y="101" width="1.0" height="15.0" fill="rgb(212,219,5)" rx="2" ry="2" />
+<text  x="460.92" y="111.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="185.2" y="181" width="0.2" height="15.0" fill="rgb(218,140,0)" rx="2" ry="2" />
+<text  x="188.21" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_http_rewrite_handler (11 samples, 0.09%)</title><rect x="578.6" y="261" width="1.1" height="15.0" fill="rgb(231,212,23)" rx="2" ry="2" />
+<text  x="581.61" y="271.5" ></text>
+</g>
+<g >
+<title>recv (7 samples, 0.06%)</title><rect x="1060.9" y="277" width="0.7" height="15.0" fill="rgb(245,51,15)" rx="2" ry="2" />
+<text  x="1063.87" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_charset_body_filter (2 samples, 0.02%)</title><rect x="1189.8" y="389" width="0.2" height="15.0" fill="rgb(215,10,50)" rx="2" ry="2" />
+<text  x="1192.80" y="399.5" ></text>
+</g>
+<g >
+<title>lj_BC_TSETS (3 samples, 0.03%)</title><rect x="164.7" y="213" width="0.3" height="15.0" fill="rgb(247,46,7)" rx="2" ry="2" />
+<text  x="167.73" y="223.5" ></text>
+</g>
+<g >
+<title>accept4 (12 samples, 0.10%)</title><rect x="67.8" y="309" width="1.2" height="15.0" fill="rgb(221,57,30)" rx="2" ry="2" />
+<text  x="70.84" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_http_ssi_body_filter (18 samples, 0.15%)</title><rect x="1024.6" y="133" width="1.8" height="15.0" fill="rgb(236,33,5)" rx="2" ry="2" />
+<text  x="1027.63" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_core_generic_phase (34 samples, 0.29%)</title><rect x="572.7" y="277" width="3.4" height="15.0" fill="rgb(224,218,13)" rx="2" ry="2" />
+<text  x="575.69" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_addition_body_filter (2 samples, 0.02%)</title><rect x="1189.8" y="405" width="0.2" height="15.0" fill="rgb(237,44,27)" rx="2" ry="2" />
+<text  x="1192.80" y="415.5" ></text>
+</g>
+<g >
+<title>ngx_master_process_cycle (11,459 samples, 97.51%)</title><rect x="38.4" y="421" width="1150.6" height="15.0" fill="rgb(247,12,12)" rx="2" ry="2" />
+<text  x="41.42" y="431.5" >ngx_master_process_cycle</text>
+</g>
+<g >
+<title>lj_alloc_free (11 samples, 0.09%)</title><rect x="17.1" y="389" width="1.1" height="15.0" fill="rgb(205,123,5)" rx="2" ry="2" />
+<text  x="20.13" y="399.5" ></text>
+</g>
+<g >
+<title>lj_meta_tget (8 samples, 0.07%)</title><rect x="174.0" y="181" width="0.8" height="15.0" fill="rgb(240,104,52)" rx="2" ry="2" />
+<text  x="176.97" y="191.5" ></text>
+</g>
+<g >
+<title>epoll_ctl (5 samples, 0.04%)</title><rect x="183.3" y="197" width="0.5" height="15.0" fill="rgb(244,66,38)" rx="2" ry="2" />
+<text  x="186.30" y="207.5" ></text>
+</g>
+<g >
+<title>__sigsetjmp (6 samples, 0.05%)</title><rect x="161.2" y="213" width="0.6" height="15.0" fill="rgb(214,202,8)" rx="2" ry="2" />
+<text  x="164.22" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_memalign (6 samples, 0.05%)</title><rect x="75.7" y="277" width="0.6" height="15.0" fill="rgb(247,104,5)" rx="2" ry="2" />
+<text  x="78.67" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_free_request (94 samples, 0.80%)</title><rect x="712.0" y="277" width="9.4" height="15.0" fill="rgb(224,195,11)" rx="2" ry="2" />
+<text  x="714.96" y="287.5" ></text>
+</g>
+<g >
+<title>lj_func_free (2 samples, 0.02%)</title><rect x="18.2" y="389" width="0.2" height="15.0" fill="rgb(230,108,40)" rx="2" ry="2" />
+<text  x="21.23" y="399.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0c601 (3 samples, 0.03%)</title><rect x="30.5" y="469" width="0.3" height="15.0" fill="rgb(226,0,47)" rx="2" ry="2" />
+<text  x="33.48" y="479.5" ></text>
+</g>
+<g >
+<title>lj_BC_UGET (8 samples, 0.07%)</title><rect x="448.7" y="133" width="0.8" height="15.0" fill="rgb(208,141,3)" rx="2" ry="2" />
+<text  x="451.68" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_chain_get_free_buf (2 samples, 0.02%)</title><rect x="1022.1" y="261" width="0.2" height="15.0" fill="rgb(219,146,47)" rx="2" ry="2" />
+<text  x="1025.12" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_finalize_connection (168 samples, 1.43%)</title><rect x="711.1" y="293" width="16.8" height="15.0" fill="rgb(226,43,27)" rx="2" ry="2" />
+<text  x="714.05" y="303.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (15 samples, 0.13%)</title><rect x="194.3" y="181" width="1.6" height="15.0" fill="rgb(238,77,45)" rx="2" ry="2" />
+<text  x="197.35" y="191.5" ></text>
+</g>
+<g >
+<title>lj_cont_stitch (4 samples, 0.03%)</title><rect x="449.9" y="133" width="0.4" height="15.0" fill="rgb(251,163,16)" rx="2" ry="2" />
+<text  x="452.89" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_check_broken_connection (3 samples, 0.03%)</title><rect x="586.8" y="309" width="0.3" height="15.0" fill="rgb(216,50,18)" rx="2" ry="2" />
+<text  x="589.85" y="319.5" ></text>
+</g>
+<g >
+<title>index2adr (2 samples, 0.02%)</title><rect x="150.4" y="181" width="0.2" height="15.0" fill="rgb(240,49,44)" rx="2" ry="2" />
+<text  x="153.37" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (9 samples, 0.08%)</title><rect x="1183.8" y="261" width="0.9" height="15.0" fill="rgb(217,97,47)" rx="2" ry="2" />
+<text  x="1186.77" y="271.5" ></text>
+</g>
+<g >
+<title>lj_BC_RET0 (2 samples, 0.02%)</title><rect x="435.6" y="133" width="0.2" height="15.0" fill="rgb(221,49,23)" rx="2" ry="2" />
+<text  x="438.63" y="143.5" ></text>
+</g>
+<g >
+<title>lj_vm_leave_cp (2 samples, 0.02%)</title><rect x="167.9" y="213" width="0.2" height="15.0" fill="rgb(220,162,18)" rx="2" ry="2" />
+<text  x="170.94" y="223.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0bc0b (2 samples, 0.02%)</title><rect x="12.0" y="469" width="0.2" height="15.0" fill="rgb(246,162,20)" rx="2" ry="2" />
+<text  x="15.01" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_core_content_phase (3,887 samples, 33.08%)</title><rect x="179.5" y="277" width="390.3" height="15.0" fill="rgb(224,98,12)" rx="2" ry="2" />
+<text  x="182.49" y="287.5" >ngx_http_core_content_phase</text>
+</g>
+<g >
+<title>0x7ff0fdd0bde7 (2 samples, 0.02%)</title><rect x="25.8" y="469" width="0.2" height="15.0" fill="rgb(252,221,27)" rx="2" ry="2" />
+<text  x="28.76" y="479.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (4 samples, 0.03%)</title><rect x="196.8" y="181" width="0.4" height="15.0" fill="rgb(241,212,30)" rx="2" ry="2" />
+<text  x="199.76" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_process_headers (59 samples, 0.50%)</title><rect x="637.9" y="293" width="5.9" height="15.0" fill="rgb(220,59,44)" rx="2" ry="2" />
+<text  x="640.85" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_handle_write_event (8 samples, 0.07%)</title><rect x="1021.1" y="277" width="0.8" height="15.0" fill="rgb(228,122,37)" rx="2" ry="2" />
+<text  x="1024.11" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_get_connection (20 samples, 0.17%)</title><rect x="418.3" y="181" width="2.0" height="15.0" fill="rgb(206,113,54)" rx="2" ry="2" />
+<text  x="421.26" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_create (25 samples, 0.21%)</title><rect x="566.2" y="245" width="2.5" height="15.0" fill="rgb(250,108,0)" rx="2" ry="2" />
+<text  x="569.16" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_vslprintf (15 samples, 0.13%)</title><rect x="608.8" y="197" width="1.5" height="15.0" fill="rgb(235,218,34)" rx="2" ry="2" />
+<text  x="611.84" y="207.5" ></text>
+</g>
+<g >
+<title>luaL_unref (8 samples, 0.07%)</title><rect x="169.3" y="197" width="0.9" height="15.0" fill="rgb(233,124,0)" rx="2" ry="2" />
+<text  x="172.35" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_charset_body_filter (20 samples, 0.17%)</title><rect x="1024.4" y="149" width="2.0" height="15.0" fill="rgb(209,16,28)" rx="2" ry="2" />
+<text  x="1027.43" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_finalize_threads.isra.2 (2 samples, 0.02%)</title><rect x="719.9" y="261" width="0.2" height="15.0" fill="rgb(220,37,11)" rx="2" ry="2" />
+<text  x="722.89" y="271.5" ></text>
+</g>
+<g >
+<title>gc_mark (2 samples, 0.02%)</title><rect x="461.2" y="101" width="0.2" height="15.0" fill="rgb(231,190,2)" rx="2" ry="2" />
+<text  x="464.24" y="111.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="192.4" y="165" width="0.2" height="15.0" fill="rgb(224,113,30)" rx="2" ry="2" />
+<text  x="195.44" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_close_connection (23 samples, 0.20%)</title><rect x="708.7" y="293" width="2.4" height="15.0" fill="rgb(249,101,23)" rx="2" ry="2" />
+<text  x="711.74" y="303.5" ></text>
+</g>
+<g >
+<title>_init (3 samples, 0.03%)</title><rect x="715.4" y="213" width="0.3" height="15.0" fill="rgb(232,96,25)" rx="2" ry="2" />
+<text  x="718.37" y="223.5" ></text>
+</g>
+<g >
+<title>__strlen_sse2_pminub (8 samples, 0.07%)</title><rect x="173.0" y="181" width="0.8" height="15.0" fill="rgb(231,94,21)" rx="2" ry="2" />
+<text  x="175.96" y="191.5" ></text>
+</g>
+<g >
+<title>lj_meta_cat (18 samples, 0.15%)</title><rect x="427.5" y="117" width="1.8" height="15.0" fill="rgb(234,107,40)" rx="2" ry="2" />
+<text  x="430.50" y="127.5" ></text>
+</g>
+<g >
+<title>lj_BC_FUNCC (2 samples, 0.02%)</title><rect x="128.4" y="213" width="0.2" height="15.0" fill="rgb(235,40,20)" rx="2" ry="2" />
+<text  x="131.38" y="223.5" ></text>
+</g>
+<g >
+<title>lj_BC_CALLT (2 samples, 0.02%)</title><rect x="427.1" y="133" width="0.2" height="15.0" fill="rgb(253,147,44)" rx="2" ry="2" />
+<text  x="430.10" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (11 samples, 0.09%)</title><rect x="568.7" y="245" width="1.1" height="15.0" fill="rgb(224,130,28)" rx="2" ry="2" />
+<text  x="571.67" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_http_close_connection (3 samples, 0.03%)</title><rect x="69.5" y="325" width="0.3" height="15.0" fill="rgb(242,62,0)" rx="2" ry="2" />
+<text  x="72.54" y="335.5" ></text>
+</g>
+<g >
+<title>lj_alloc_free (11 samples, 0.09%)</title><rect x="18.7" y="373" width="1.1" height="15.0" fill="rgb(254,73,38)" rx="2" ry="2" />
+<text  x="21.74" y="383.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_insert_timer_value (44 samples, 0.37%)</title><rect x="561.7" y="181" width="4.5" height="15.0" fill="rgb(243,135,39)" rx="2" ry="2" />
+<text  x="564.74" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_process_events_and_timers (11,459 samples, 97.51%)</title><rect x="38.4" y="357" width="1150.6" height="15.0" fill="rgb(241,125,5)" rx="2" ry="2" />
+<text  x="41.42" y="367.5" >ngx_process_events_and_timers</text>
+</g>
+<g >
+<title>ngx_http_create_request (1 samples, 0.01%)</title><rect x="1187.9" y="309" width="0.1" height="15.0" fill="rgb(252,151,3)" rx="2" ry="2" />
+<text  x="1190.89" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_ngx_ctx_cleanup (45 samples, 0.38%)</title><rect x="715.2" y="245" width="4.5" height="15.0" fill="rgb(249,29,6)" rx="2" ry="2" />
+<text  x="718.17" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_run_thread (106 samples, 0.90%)</title><rect x="160.1" y="229" width="10.7" height="15.0" fill="rgb(247,111,43)" rx="2" ry="2" />
+<text  x="163.11" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_http_proxy_add_x_forwarded_for_variable (4 samples, 0.03%)</title><rect x="199.4" y="165" width="0.4" height="15.0" fill="rgb(226,182,47)" rx="2" ry="2" />
+<text  x="202.37" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_http_try_files_handler (6 samples, 0.05%)</title><rect x="575.5" y="261" width="0.6" height="15.0" fill="rgb(254,27,13)" rx="2" ry="2" />
+<text  x="578.50" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_memalign (8 samples, 0.07%)</title><rect x="607.2" y="181" width="0.8" height="15.0" fill="rgb(236,107,2)" rx="2" ry="2" />
+<text  x="610.23" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (2 samples, 0.02%)</title><rect x="179.3" y="229" width="0.2" height="15.0" fill="rgb(238,148,5)" rx="2" ry="2" />
+<text  x="182.29" y="239.5" ></text>
+</g>
+<g >
+<title>lua_pushcclosure (27 samples, 0.23%)</title><rect x="458.9" y="149" width="2.7" height="15.0" fill="rgb(246,25,0)" rx="2" ry="2" />
+<text  x="461.93" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_http_get_indexed_variable (2 samples, 0.02%)</title><rect x="197.2" y="181" width="0.2" height="15.0" fill="rgb(252,41,24)" rx="2" ry="2" />
+<text  x="200.16" y="191.5" ></text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="465.5" y="165" width="0.2" height="15.0" fill="rgb(210,176,42)" rx="2" ry="2" />
+<text  x="468.45" y="175.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_delete (14 samples, 0.12%)</title><rect x="895.6" y="261" width="1.4" height="15.0" fill="rgb(242,77,16)" rx="2" ry="2" />
+<text  x="898.60" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_hash_find (11 samples, 0.09%)</title><rect x="138.6" y="293" width="1.1" height="15.0" fill="rgb(218,42,49)" rx="2" ry="2" />
+<text  x="141.62" y="303.5" ></text>
+</g>
+<g >
+<title>index2adr (2 samples, 0.02%)</title><rect x="716.8" y="197" width="0.2" height="15.0" fill="rgb(211,106,3)" rx="2" ry="2" />
+<text  x="719.78" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_generic_phase_post_read (8 samples, 0.07%)</title><rect x="178.5" y="229" width="0.8" height="15.0" fill="rgb(212,10,21)" rx="2" ry="2" />
+<text  x="181.49" y="239.5" ></text>
+</g>
+<g >
+<title>newtab (8 samples, 0.07%)</title><rect x="25.0" y="437" width="0.8" height="15.0" fill="rgb(227,212,41)" rx="2" ry="2" />
+<text  x="27.96" y="447.5" ></text>
+</g>
+<g >
+<title>ngx_http_core_run_phases (4,382 samples, 37.29%)</title><rect x="139.7" y="293" width="440.0" height="15.0" fill="rgb(218,125,47)" rx="2" ry="2" />
+<text  x="142.73" y="303.5" >ngx_http_core_run_phases</text>
+</g>
+<g >
+<title>lj_vm_exit_handler (2 samples, 0.02%)</title><rect x="1189.0" y="469" width="0.2" height="15.0" fill="rgb(237,5,44)" rx="2" ry="2" />
+<text  x="1192.00" y="479.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0c80f (2 samples, 0.02%)</title><rect x="30.8" y="469" width="0.2" height="15.0" fill="rgb(251,189,23)" rx="2" ry="2" />
+<text  x="33.78" y="479.5" ></text>
+</g>
+<g >
+<title>lj_alloc_malloc (4 samples, 0.03%)</title><rect x="459.3" y="101" width="0.4" height="15.0" fill="rgb(232,116,36)" rx="2" ry="2" />
+<text  x="462.33" y="111.5" ></text>
+</g>
+<g >
+<title>ioctl (179 samples, 1.52%)</title><rect x="465.7" y="165" width="17.9" height="15.0" fill="rgb(225,138,29)" rx="2" ry="2" />
+<text  x="468.65" y="175.5" ></text>
+</g>
+<g >
+<title>lua_gettop (3 samples, 0.03%)</title><rect x="147.8" y="197" width="0.3" height="15.0" fill="rgb(248,133,36)" rx="2" ry="2" />
+<text  x="150.76" y="207.5" ></text>
+</g>
+<g >
+<title>lj_BC_ADDVN (2 samples, 0.02%)</title><rect x="422.9" y="133" width="0.2" height="15.0" fill="rgb(236,167,11)" rx="2" ry="2" />
+<text  x="425.88" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_pnalloc (3 samples, 0.03%)</title><rect x="634.3" y="277" width="0.3" height="15.0" fill="rgb(229,165,25)" rx="2" ry="2" />
+<text  x="637.34" y="287.5" ></text>
+</g>
+<g >
+<title>lj_vm_return (2 samples, 0.02%)</title><rect x="455.1" y="133" width="0.2" height="15.0" fill="rgb(231,6,30)" rx="2" ry="2" />
+<text  x="458.11" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (3 samples, 0.03%)</title><rect x="192.3" y="181" width="0.3" height="15.0" fill="rgb(222,47,18)" rx="2" ry="2" />
+<text  x="195.34" y="191.5" ></text>
+</g>
+<g >
+<title>lj_BC_FUNCC (2 samples, 0.02%)</title><rect x="128.4" y="261" width="0.2" height="15.0" fill="rgb(223,84,10)" rx="2" ry="2" />
+<text  x="131.38" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_output_chain (2 samples, 0.02%)</title><rect x="1189.8" y="469" width="0.2" height="15.0" fill="rgb(250,188,16)" rx="2" ry="2" />
+<text  x="1192.80" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_create_pool (6 samples, 0.05%)</title><rect x="75.7" y="293" width="0.6" height="15.0" fill="rgb(239,18,37)" rx="2" ry="2" />
+<text  x="78.67" y="303.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0bc9a (124 samples, 1.06%)</title><rect x="12.2" y="469" width="12.5" height="15.0" fill="rgb(224,140,37)" rx="2" ry="2" />
+<text  x="15.21" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_http_init_connection (5 samples, 0.04%)</title><rect x="69.0" y="309" width="0.5" height="15.0" fill="rgb(228,174,14)" rx="2" ry="2" />
+<text  x="72.04" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_process_header (1,129 samples, 9.61%)</title><rect x="594.8" y="309" width="113.3" height="15.0" fill="rgb(242,107,24)" rx="2" ry="2" />
+<text  x="597.78" y="319.5" >ngx_http_upstr..</text>
+</g>
+<g >
+<title>0x7ff0fdd0bcb5 (11 samples, 0.09%)</title><rect x="24.7" y="469" width="1.1" height="15.0" fill="rgb(238,97,49)" rx="2" ry="2" />
+<text  x="27.66" y="479.5" ></text>
+</g>
+<g >
+<title>__close_nocancel (23 samples, 0.20%)</title><rect x="708.7" y="261" width="2.4" height="15.0" fill="rgb(216,12,26)" rx="2" ry="2" />
+<text  x="711.74" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_epoll_add_event (5 samples, 0.04%)</title><rect x="69.0" y="277" width="0.5" height="15.0" fill="rgb(252,206,31)" rx="2" ry="2" />
+<text  x="72.04" y="287.5" ></text>
+</g>
+<g >
+<title>_int_malloc (9 samples, 0.08%)</title><rect x="203.1" y="133" width="0.9" height="15.0" fill="rgb(254,27,37)" rx="2" ry="2" />
+<text  x="206.09" y="143.5" ></text>
+</g>
+<g >
+<title>gc_sweep (74 samples, 0.63%)</title><rect x="12.4" y="405" width="7.4" height="15.0" fill="rgb(238,75,45)" rx="2" ry="2" />
+<text  x="15.41" y="415.5" ></text>
+</g>
+<g >
+<title>lua_pushlstring (17 samples, 0.14%)</title><rect x="717.0" y="229" width="1.7" height="15.0" fill="rgb(226,103,4)" rx="2" ry="2" />
+<text  x="719.98" y="239.5" ></text>
+</g>
+<g >
+<title>lua_remove (3 samples, 0.03%)</title><rect x="177.7" y="197" width="0.3" height="15.0" fill="rgb(216,95,54)" rx="2" ry="2" />
+<text  x="180.68" y="207.5" ></text>
+</g>
+<g >
+<title>__GI_memset (20 samples, 0.17%)</title><rect x="566.7" y="213" width="2.0" height="15.0" fill="rgb(215,214,46)" rx="2" ry="2" />
+<text  x="569.66" y="223.5" ></text>
+</g>
+<g >
+<title>lj_BC_RET (2 samples, 0.02%)</title><rect x="435.4" y="133" width="0.2" height="15.0" fill="rgb(213,92,37)" rx="2" ry="2" />
+<text  x="438.43" y="143.5" ></text>
+</g>
+<g >
+<title>lua_resume (6 samples, 0.05%)</title><rect x="168.5" y="213" width="0.6" height="15.0" fill="rgb(218,58,51)" rx="2" ry="2" />
+<text  x="171.54" y="223.5" ></text>
+</g>
+<g >
+<title>__connect_nocancel (1,485 samples, 12.64%)</title><rect x="205.5" y="181" width="149.1" height="15.0" fill="rgb(223,52,34)" rx="2" ry="2" />
+<text  x="208.50" y="191.5" >__connect_nocancel</text>
+</g>
+<g >
+<title>ioctl (4 samples, 0.03%)</title><rect x="371.6" y="181" width="0.4" height="15.0" fill="rgb(215,24,27)" rx="2" ry="2" />
+<text  x="374.57" y="191.5" ></text>
+</g>
+<g >
+<title>lua_settop (2 samples, 0.02%)</title><rect x="169.1" y="213" width="0.2" height="15.0" fill="rgb(223,0,54)" rx="2" ry="2" />
+<text  x="172.15" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_post_action (4 samples, 0.03%)</title><rect x="729.1" y="277" width="0.4" height="15.0" fill="rgb(218,150,33)" rx="2" ry="2" />
+<text  x="732.13" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="643.8" y="293" width="0.2" height="15.0" fill="rgb(225,132,17)" rx="2" ry="2" />
+<text  x="646.78" y="303.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="569.6" y="229" width="0.2" height="15.0" fill="rgb(218,202,13)" rx="2" ry="2" />
+<text  x="572.58" y="239.5" ></text>
+</g>
+<g >
+<title>all (11,752 samples, 100%)</title><rect x="10.0" y="485" width="1180.0" height="15.0" fill="rgb(223,72,21)" rx="2" ry="2" />
+<text  x="13.00" y="495.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_run_thread (2 samples, 0.02%)</title><rect x="128.4" y="277" width="0.2" height="15.0" fill="rgb(220,135,10)" rx="2" ry="2" />
+<text  x="131.38" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_sprintf (16 samples, 0.14%)</title><rect x="608.7" y="213" width="1.6" height="15.0" fill="rgb(210,218,15)" rx="2" ry="2" />
+<text  x="611.74" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_trailers_filter (1,178 samples, 10.02%)</title><rect x="900.4" y="197" width="118.3" height="15.0" fill="rgb(217,128,44)" rx="2" ry="2" />
+<text  x="903.42" y="207.5" >ngx_http_trail..</text>
+</g>
+<g >
+<title>ngx_http_gunzip_body_filter (22 samples, 0.19%)</title><rect x="1024.2" y="181" width="2.2" height="15.0" fill="rgb(221,226,12)" rx="2" ry="2" />
+<text  x="1027.23" y="191.5" ></text>
+</g>
+<g >
+<title>lj_mem_newgco (12 samples, 0.10%)</title><rect x="151.6" y="181" width="1.2" height="15.0" fill="rgb(225,217,10)" rx="2" ry="2" />
+<text  x="154.58" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_http_write_filter (2 samples, 0.02%)</title><rect x="1189.8" y="325" width="0.2" height="15.0" fill="rgb(250,192,5)" rx="2" ry="2" />
+<text  x="1192.80" y="335.5" ></text>
+</g>
+<g >
+<title>recv (9 samples, 0.08%)</title><rect x="584.0" y="293" width="0.9" height="15.0" fill="rgb(252,226,34)" rx="2" ry="2" />
+<text  x="587.04" y="303.5" ></text>
+</g>
+<g >
+<title>main_arena (6 samples, 0.05%)</title><rect x="1189.2" y="469" width="0.6" height="15.0" fill="rgb(216,23,43)" rx="2" ry="2" />
+<text  x="1192.20" y="479.5" ></text>
+</g>
+<g >
+<title>__libc_start_main (11,459 samples, 97.51%)</title><rect x="38.4" y="453" width="1150.6" height="15.0" fill="rgb(234,226,47)" rx="2" ry="2" />
+<text  x="41.42" y="463.5" >__libc_start_main</text>
+</g>
+<g >
+<title>ngx_http_upstream_output_filter (48 samples, 0.41%)</title><rect x="1022.3" y="277" width="4.8" height="15.0" fill="rgb(212,84,30)" rx="2" ry="2" />
+<text  x="1025.32" y="287.5" ></text>
+</g>
+<g >
+<title>lua_rawseti (2 samples, 0.02%)</title><rect x="170.4" y="197" width="0.2" height="15.0" fill="rgb(220,101,49)" rx="2" ry="2" />
+<text  x="173.35" y="207.5" ></text>
+</g>
+<g >
+<title>lj_gc_step_jit (124 samples, 1.06%)</title><rect x="12.2" y="453" width="12.5" height="15.0" fill="rgb(230,144,49)" rx="2" ry="2" />
+<text  x="15.21" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_event_pipe (416 samples, 3.54%)</title><rect x="1019.8" y="293" width="41.8" height="15.0" fill="rgb(212,226,1)" rx="2" ry="2" />
+<text  x="1022.81" y="303.5" >ngx..</text>
+</g>
+<g >
+<title>lj_BC_CAT (20 samples, 0.17%)</title><rect x="427.3" y="133" width="2.0" height="15.0" fill="rgb(218,108,37)" rx="2" ry="2" />
+<text  x="430.30" y="143.5" ></text>
+</g>
+<g >
+<title>lj_vm_call_dispatch_f (2 samples, 0.02%)</title><rect x="451.8" y="133" width="0.2" height="15.0" fill="rgb(242,31,0)" rx="2" ry="2" />
+<text  x="454.80" y="143.5" ></text>
+</g>
+<g >
+<title>lua_pushlightuserdata (2 samples, 0.02%)</title><rect x="464.4" y="117" width="0.2" height="15.0" fill="rgb(228,131,35)" rx="2" ry="2" />
+<text  x="467.45" y="127.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_cache_load_code.isra.0 (14 samples, 0.12%)</title><rect x="463.2" y="133" width="1.4" height="15.0" fill="rgb(222,61,14)" rx="2" ry="2" />
+<text  x="466.24" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_epoll_process_events (11,457 samples, 97.49%)</title><rect x="38.4" y="341" width="1150.4" height="15.0" fill="rgb(249,145,52)" rx="2" ry="2" />
+<text  x="41.42" y="351.5" >ngx_epoll_process_events</text>
+</g>
+<g >
+<title>ngx_unix_recv (3 samples, 0.03%)</title><rect x="128.6" y="293" width="0.3" height="15.0" fill="rgb(243,193,19)" rx="2" ry="2" />
+<text  x="131.58" y="303.5" ></text>
+</g>
+<g >
+<title>lj_tab_get (14 samples, 0.12%)</title><rect x="456.5" y="101" width="1.4" height="15.0" fill="rgb(238,106,49)" rx="2" ry="2" />
+<text  x="459.52" y="111.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="81.1" y="309" width="0.2" height="15.0" fill="rgb(237,190,45)" rx="2" ry="2" />
+<text  x="84.09" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_init (14 samples, 0.12%)</title><rect x="182.4" y="229" width="1.4" height="15.0" fill="rgb(213,114,29)" rx="2" ry="2" />
+<text  x="185.40" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_create_pool (1 samples, 0.01%)</title><rect x="1187.9" y="293" width="0.1" height="15.0" fill="rgb(210,114,11)" rx="2" ry="2" />
+<text  x="1190.89" y="303.5" ></text>
+</g>
+<g >
+<title>lj_vm_return (2 samples, 0.02%)</title><rect x="168.1" y="213" width="0.2" height="15.0" fill="rgb(228,176,17)" rx="2" ry="2" />
+<text  x="171.14" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_coolkit_override_method_handler (18 samples, 0.15%)</title><rect x="576.8" y="261" width="1.8" height="15.0" fill="rgb(243,11,26)" rx="2" ry="2" />
+<text  x="579.81" y="271.5" ></text>
+</g>
+<g >
+<title>_start (11,459 samples, 97.51%)</title><rect x="38.4" y="469" width="1150.6" height="15.0" fill="rgb(235,26,32)" rx="2" ry="2" />
+<text  x="41.42" y="479.5" >_start</text>
+</g>
+<g >
+<title>ngx_memalign (19 samples, 0.16%)</title><rect x="202.1" y="181" width="1.9" height="15.0" fill="rgb(223,29,1)" rx="2" ry="2" />
+<text  x="205.08" y="191.5" ></text>
+</g>
+<g >
+<title>ngx_sprintf (15 samples, 0.13%)</title><rect x="28.7" y="421" width="1.5" height="15.0" fill="rgb(217,80,23)" rx="2" ry="2" />
+<text  x="31.68" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_sprintf (13 samples, 0.11%)</title><rect x="33.9" y="421" width="1.3" height="15.0" fill="rgb(206,28,6)" rx="2" ry="2" />
+<text  x="36.90" y="431.5" ></text>
+</g>
+<g >
+<title>ngx_http_chunked_body_filter (4 samples, 0.03%)</title><rect x="1025.0" y="101" width="0.4" height="15.0" fill="rgb(205,31,18)" rx="2" ry="2" />
+<text  x="1028.03" y="111.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (2 samples, 0.02%)</title><rect x="29.6" y="389" width="0.2" height="15.0" fill="rgb(224,218,7)" rx="2" ry="2" />
+<text  x="32.58" y="399.5" ></text>
+</g>
+<g >
+<title>lj_mem_newgco (4 samples, 0.03%)</title><rect x="459.3" y="117" width="0.4" height="15.0" fill="rgb(214,174,33)" rx="2" ry="2" />
+<text  x="462.33" y="127.5" ></text>
+</g>
+<g >
+<title>_init (3 samples, 0.03%)</title><rect x="147.0" y="213" width="0.3" height="15.0" fill="rgb(247,127,54)" rx="2" ry="2" />
+<text  x="149.96" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_finalize_connection (2 samples, 0.02%)</title><rect x="179.9" y="261" width="0.2" height="15.0" fill="rgb(243,23,26)" rx="2" ry="2" />
+<text  x="182.89" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_output_chain (1 samples, 0.01%)</title><rect x="10.0" y="453" width="0.1" height="15.0" fill="rgb(248,207,38)" rx="2" ry="2" />
+<text  x="13.00" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_request_cleanup (13 samples, 0.11%)</title><rect x="720.1" y="261" width="1.3" height="15.0" fill="rgb(229,64,38)" rx="2" ry="2" />
+<text  x="723.09" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_ssi_body_filter (1 samples, 0.01%)</title><rect x="10.0" y="357" width="0.1" height="15.0" fill="rgb(206,68,25)" rx="2" ry="2" />
+<text  x="13.00" y="367.5" ></text>
+</g>
+<g >
+<title>ngx_http_write_filter (1 samples, 0.01%)</title><rect x="10.0" y="309" width="0.1" height="15.0" fill="rgb(254,16,3)" rx="2" ry="2" />
+<text  x="13.00" y="319.5" ></text>
+</g>
+<g >
+<title>lj_tab_free (11 samples, 0.09%)</title><rect x="18.7" y="389" width="1.1" height="15.0" fill="rgb(239,195,43)" rx="2" ry="2" />
+<text  x="21.74" y="399.5" ></text>
+</g>
+<g >
+<title>__memcpy_ssse3_back (2 samples, 0.02%)</title><rect x="636.0" y="277" width="0.2" height="15.0" fill="rgb(231,98,24)" rx="2" ry="2" />
+<text  x="639.05" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_test_connect (198 samples, 1.68%)</title><rect x="1063.7" y="293" width="19.9" height="15.0" fill="rgb(207,120,29)" rx="2" ry="2" />
+<text  x="1066.69" y="303.5" ></text>
+</g>
+<g >
+<title>index2adr (2 samples, 0.02%)</title><rect x="149.8" y="181" width="0.2" height="15.0" fill="rgb(210,72,15)" rx="2" ry="2" />
+<text  x="152.77" y="191.5" ></text>
+</g>
+<g >
+<title>json_process_value (2 samples, 0.02%)</title><rect x="128.4" y="181" width="0.2" height="15.0" fill="rgb(245,199,3)" rx="2" ry="2" />
+<text  x="131.38" y="191.5" ></text>
+</g>
+<g >
+<title>writev (1 samples, 0.01%)</title><rect x="10.0" y="261" width="0.1" height="15.0" fill="rgb(239,28,9)" rx="2" ry="2" />
+<text  x="13.00" y="271.5" ></text>
+</g>
+<g >
+<title>lj_buf_putmem (2 samples, 0.02%)</title><rect x="427.7" y="101" width="0.2" height="15.0" fill="rgb(205,221,33)" rx="2" ry="2" />
+<text  x="430.70" y="111.5" ></text>
+</g>
+<g >
+<title>free (3 samples, 0.03%)</title><rect x="714.9" y="245" width="0.3" height="15.0" fill="rgb(248,40,7)" rx="2" ry="2" />
+<text  x="717.87" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_send_request (1,252 samples, 10.65%)</title><rect x="1061.6" y="309" width="125.7" height="15.0" fill="rgb(238,228,49)" rx="2" ry="2" />
+<text  x="1064.58" y="319.5" >ngx_http_upstre..</text>
+</g>
+<g >
+<title>ngx_memalign (7 samples, 0.06%)</title><rect x="586.1" y="293" width="0.7" height="15.0" fill="rgb(206,22,35)" rx="2" ry="2" />
+<text  x="589.14" y="303.5" ></text>
+</g>
+<g >
+<title>__close_nocancel (7 samples, 0.06%)</title><rect x="37.7" y="469" width="0.7" height="15.0" fill="rgb(253,44,0)" rx="2" ry="2" />
+<text  x="40.71" y="479.5" ></text>
+</g>
+<g >
+<title>lj_BC_TGETS (123 samples, 1.05%)</title><rect x="436.3" y="133" width="12.4" height="15.0" fill="rgb(245,24,18)" rx="2" ry="2" />
+<text  x="439.33" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_trailers_filter (22 samples, 0.19%)</title><rect x="1024.2" y="197" width="2.2" height="15.0" fill="rgb(246,191,19)" rx="2" ry="2" />
+<text  x="1027.23" y="207.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0ce28 (2 samples, 0.02%)</title><rect x="31.9" y="469" width="0.2" height="15.0" fill="rgb(205,154,27)" rx="2" ry="2" />
+<text  x="34.89" y="479.5" ></text>
+</g>
+<g >
+<title>ngx_unix_recv (440 samples, 3.74%)</title><rect x="84.2" y="309" width="44.2" height="15.0" fill="rgb(225,107,38)" rx="2" ry="2" />
+<text  x="87.20" y="319.5" >ngx_..</text>
+</g>
+<g >
+<title>ngx_pcalloc (1 samples, 0.01%)</title><rect x="1026.4" y="229" width="0.1" height="15.0" fill="rgb(206,154,44)" rx="2" ry="2" />
+<text  x="1029.43" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_event_connect_peer (3,561 samples, 30.30%)</title><rect x="204.0" y="197" width="357.5" height="15.0" fill="rgb(217,28,52)" rx="2" ry="2" />
+<text  x="206.99" y="207.5" >ngx_event_connect_peer</text>
+</g>
+<g >
+<title>ngx_pfree (19 samples, 0.16%)</title><rect x="721.4" y="277" width="1.9" height="15.0" fill="rgb(254,137,39)" rx="2" ry="2" />
+<text  x="724.39" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_http_log_handler (2 samples, 0.02%)</title><rect x="719.7" y="245" width="0.2" height="15.0" fill="rgb(253,36,9)" rx="2" ry="2" />
+<text  x="722.69" y="255.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="27.8" y="437" width="0.2" height="15.0" fill="rgb(225,155,53)" rx="2" ry="2" />
+<text  x="30.77" y="447.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_insert (34 samples, 0.29%)</title><rect x="723.3" y="277" width="3.4" height="15.0" fill="rgb(207,119,24)" rx="2" ry="2" />
+<text  x="726.30" y="287.5" ></text>
+</g>
+<g >
+<title>lj_BC_CALL (40 samples, 0.34%)</title><rect x="423.1" y="133" width="4.0" height="15.0" fill="rgb(224,224,12)" rx="2" ry="2" />
+<text  x="426.08" y="143.5" ></text>
+</g>
+<g >
+<title>lj_str_new (11 samples, 0.09%)</title><rect x="463.3" y="101" width="1.1" height="15.0" fill="rgb(230,215,1)" rx="2" ry="2" />
+<text  x="466.34" y="111.5" ></text>
+</g>
+<g >
+<title>ngx_http_chunked_header_filter (3 samples, 0.03%)</title><rect x="603.5" y="229" width="0.3" height="15.0" fill="rgb(232,26,12)" rx="2" ry="2" />
+<text  x="606.51" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_http_cleanup_add (2 samples, 0.02%)</title><rect x="146.2" y="229" width="0.2" height="15.0" fill="rgb(209,49,50)" rx="2" ry="2" />
+<text  x="149.15" y="239.5" ></text>
+</g>
+<g >
+<title>ngx_http_parse_status_line (7 samples, 0.06%)</title><rect x="636.4" y="277" width="0.8" height="15.0" fill="rgb(220,132,20)" rx="2" ry="2" />
+<text  x="639.45" y="287.5" ></text>
+</g>
+<g >
+<title>__GI_memset (1 samples, 0.01%)</title><rect x="1026.4" y="213" width="0.1" height="15.0" fill="rgb(214,35,47)" rx="2" ry="2" />
+<text  x="1029.43" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_v2_header_filter (70 samples, 0.60%)</title><rect x="603.3" y="245" width="7.0" height="15.0" fill="rgb(214,61,15)" rx="2" ry="2" />
+<text  x="606.31" y="255.5" ></text>
+</g>
+<g >
+<title>lj_BC_MOV (2 samples, 0.02%)</title><rect x="435.2" y="133" width="0.2" height="15.0" fill="rgb(215,184,48)" rx="2" ry="2" />
+<text  x="438.23" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_send_header (7 samples, 0.06%)</title><rect x="637.2" y="293" width="0.7" height="15.0" fill="rgb(236,175,4)" rx="2" ry="2" />
+<text  x="640.15" y="303.5" ></text>
+</g>
+<g >
+<title>__libc_malloc (6 samples, 0.05%)</title><rect x="75.7" y="245" width="0.6" height="15.0" fill="rgb(227,64,15)" rx="2" ry="2" />
+<text  x="78.67" y="255.5" ></text>
+</g>
+<g >
+<title>_int_malloc (12 samples, 0.10%)</title><rect x="81.8" y="261" width="1.2" height="15.0" fill="rgb(216,21,49)" rx="2" ry="2" />
+<text  x="84.79" y="271.5" ></text>
+</g>
+<g >
+<title>lj_func_newC (4 samples, 0.03%)</title><rect x="459.3" y="133" width="0.4" height="15.0" fill="rgb(207,216,30)" rx="2" ry="2" />
+<text  x="462.33" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_write_filter (2 samples, 0.02%)</title><rect x="1025.2" y="85" width="0.2" height="15.0" fill="rgb(231,41,26)" rx="2" ry="2" />
+<text  x="1028.23" y="95.5" ></text>
+</g>
+<g >
+<title>ngx_rbtree_insert_timer_value (22 samples, 0.19%)</title><rect x="724.5" y="261" width="2.2" height="15.0" fill="rgb(216,24,51)" rx="2" ry="2" />
+<text  x="727.51" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_http_gunzip_header_filter (2 samples, 0.02%)</title><rect x="610.3" y="261" width="0.2" height="15.0" fill="rgb(236,221,42)" rx="2" ry="2" />
+<text  x="613.34" y="271.5" ></text>
+</g>
+<g >
+<title>lua_gettop (4 samples, 0.03%)</title><rect x="715.7" y="213" width="0.4" height="15.0" fill="rgb(217,140,5)" rx="2" ry="2" />
+<text  x="718.67" y="223.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_finalize_threads.isra.2 (4 samples, 0.03%)</title><rect x="159.7" y="213" width="0.4" height="15.0" fill="rgb(217,23,32)" rx="2" ry="2" />
+<text  x="162.71" y="223.5" ></text>
+</g>
+<g >
+<title>lj_meta_tget (2 samples, 0.02%)</title><rect x="168.3" y="197" width="0.2" height="15.0" fill="rgb(254,109,37)" rx="2" ry="2" />
+<text  x="171.34" y="207.5" ></text>
+</g>
+<g >
+<title>lua_insert (2 samples, 0.02%)</title><rect x="422.7" y="149" width="0.2" height="15.0" fill="rgb(212,25,19)" rx="2" ry="2" />
+<text  x="425.68" y="159.5" ></text>
+</g>
+<g >
+<title>ngx_pcalloc (46 samples, 0.39%)</title><rect x="76.5" y="293" width="4.6" height="15.0" fill="rgb(237,186,39)" rx="2" ry="2" />
+<text  x="79.47" y="303.5" ></text>
+</g>
+<g >
+<title>socket (3 samples, 0.03%)</title><rect x="584.9" y="293" width="0.3" height="15.0" fill="rgb(226,13,19)" rx="2" ry="2" />
+<text  x="587.94" y="303.5" ></text>
+</g>
+<g >
+<title>lj_vm_resume (3 samples, 0.03%)</title><rect x="10.1" y="453" width="0.3" height="15.0" fill="rgb(210,89,8)" rx="2" ry="2" />
+<text  x="13.10" y="463.5" ></text>
+</g>
+<g >
+<title>lua_tointeger (2 samples, 0.02%)</title><rect x="149.8" y="197" width="0.2" height="15.0" fill="rgb(242,102,37)" rx="2" ry="2" />
+<text  x="152.77" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_sprintf_num (4 samples, 0.03%)</title><rect x="29.8" y="389" width="0.4" height="15.0" fill="rgb(243,100,39)" rx="2" ry="2" />
+<text  x="32.78" y="399.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_ffi_balancer_set_current_peer (28 samples, 0.24%)</title><rect x="32.4" y="453" width="2.8" height="15.0" fill="rgb(231,195,43)" rx="2" ry="2" />
+<text  x="35.39" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_reusable_connection (9 samples, 0.08%)</title><rect x="83.3" y="309" width="0.9" height="15.0" fill="rgb(241,1,6)" rx="2" ry="2" />
+<text  x="86.30" y="319.5" ></text>
+</g>
+<g >
+<title>ngx_http_gzip_header_filter (2 samples, 0.02%)</title><rect x="602.4" y="245" width="0.2" height="15.0" fill="rgb(247,216,6)" rx="2" ry="2" />
+<text  x="605.41" y="255.5" ></text>
+</g>
+<g >
+<title>gc_mark (4 samples, 0.03%)</title><rect x="23.2" y="405" width="0.4" height="15.0" fill="rgb(230,104,28)" rx="2" ry="2" />
+<text  x="26.15" y="415.5" ></text>
+</g>
+<g >
+<title>lj_vmeta_tgets (2 samples, 0.02%)</title><rect x="455.5" y="133" width="0.2" height="15.0" fill="rgb(252,181,6)" rx="2" ry="2" />
+<text  x="458.51" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_read_client_request_body (3,827 samples, 32.56%)</title><rect x="181.9" y="245" width="384.3" height="15.0" fill="rgb(231,18,4)" rx="2" ry="2" />
+<text  x="184.90" y="255.5" >ngx_http_read_client_request_body</text>
+</g>
+<g >
+<title>ngx_http_upstream_copy_content_type (9 samples, 0.08%)</title><rect x="642.6" y="277" width="0.9" height="15.0" fill="rgb(209,13,9)" rx="2" ry="2" />
+<text  x="645.57" y="287.5" ></text>
+</g>
+<g >
+<title>_init (2 samples, 0.02%)</title><rect x="636.2" y="277" width="0.2" height="15.0" fill="rgb(227,214,53)" rx="2" ry="2" />
+<text  x="639.25" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_palloc_block (10 samples, 0.09%)</title><rect x="607.0" y="197" width="1.0" height="15.0" fill="rgb(229,147,28)" rx="2" ry="2" />
+<text  x="610.03" y="207.5" ></text>
+</g>
+<g >
+<title>free (2 samples, 0.02%)</title><rect x="723.1" y="261" width="0.2" height="15.0" fill="rgb(243,145,38)" rx="2" ry="2" />
+<text  x="726.10" y="271.5" ></text>
+</g>
+<g >
+<title>ngx_destroy_pool (66 samples, 0.56%)</title><rect x="713.1" y="261" width="6.6" height="15.0" fill="rgb(231,69,43)" rx="2" ry="2" />
+<text  x="716.06" y="271.5" ></text>
+</g>
+<g >
+<title>lua_type (6 samples, 0.05%)</title><rect x="150.0" y="197" width="0.6" height="15.0" fill="rgb(239,122,16)" rx="2" ry="2" />
+<text  x="152.97" y="207.5" ></text>
+</g>
+<g >
+<title>ngx_http_proxy_create_request (160 samples, 1.36%)</title><rect x="185.4" y="213" width="16.1" height="15.0" fill="rgb(220,57,49)" rx="2" ry="2" />
+<text  x="188.41" y="223.5" ></text>
+</g>
+<g >
+<title>lua_type (1 samples, 0.01%)</title><rect x="178.0" y="197" width="0.1" height="15.0" fill="rgb(232,214,22)" rx="2" ry="2" />
+<text  x="180.98" y="207.5" ></text>
+</g>
+<g >
+<title>lj_BC_IFUNCV (4 samples, 0.03%)</title><rect x="430.0" y="133" width="0.4" height="15.0" fill="rgb(231,67,0)" rx="2" ry="2" />
+<text  x="433.01" y="143.5" ></text>
+</g>
+<g >
+<title>lua_rawgeti (7 samples, 0.06%)</title><rect x="716.1" y="213" width="0.7" height="15.0" fill="rgb(217,197,27)" rx="2" ry="2" />
+<text  x="719.07" y="223.5" ></text>
+</g>
+<g >
+<title>gc_sweep (2 samples, 0.02%)</title><rect x="1189.0" y="405" width="0.2" height="15.0" fill="rgb(241,10,35)" rx="2" ry="2" />
+<text  x="1192.00" y="415.5" ></text>
+</g>
+<g >
+<title>ngx_unix_recv (8 samples, 0.07%)</title><rect x="1188.0" y="309" width="0.8" height="15.0" fill="rgb(221,157,31)" rx="2" ry="2" />
+<text  x="1190.99" y="319.5" ></text>
+</g>
+<g >
+<title>__GI_memset (2 samples, 0.02%)</title><rect x="179.3" y="213" width="0.2" height="15.0" fill="rgb(249,191,1)" rx="2" ry="2" />
+<text  x="182.29" y="223.5" ></text>
+</g>
+<g >
+<title>0x7ff0fdd0d392 (2 samples, 0.02%)</title><rect x="36.8" y="469" width="0.2" height="15.0" fill="rgb(213,177,13)" rx="2" ry="2" />
+<text  x="39.81" y="479.5" ></text>
+</g>
+<g >
+<title>lj_fff_res_ (4 samples, 0.03%)</title><rect x="451.4" y="133" width="0.4" height="15.0" fill="rgb(254,69,31)" rx="2" ry="2" />
+<text  x="454.40" y="143.5" ></text>
+</g>
+<g >
+<title>ngx_http_gunzip_body_filter (1,171 samples, 9.96%)</title><rect x="901.1" y="181" width="117.6" height="15.0" fill="rgb(212,26,45)" rx="2" ry="2" />
+<text  x="904.12" y="191.5" >ngx_http_gunzi..</text>
+</g>
+<g >
+<title>ngx_http_upstream_wr_check_broken_connection (3 samples, 0.03%)</title><rect x="587.1" y="309" width="0.3" height="15.0" fill="rgb(226,22,32)" rx="2" ry="2" />
+<text  x="590.15" y="319.5" ></text>
+</g>
+<g >
+<title>__connect_nocancel (4 samples, 0.03%)</title><rect x="1189.2" y="357" width="0.4" height="15.0" fill="rgb(233,5,48)" rx="2" ry="2" />
+<text  x="1192.20" y="367.5" ></text>
+</g>
+<g >
+<title>ngx_palloc (2 samples, 0.02%)</title><rect x="146.2" y="213" width="0.2" height="15.0" fill="rgb(208,134,18)" rx="2" ry="2" />
+<text  x="149.15" y="223.5" ></text>
+</g>
+<g >
+<title>lj_tab_newkey (2 samples, 0.02%)</title><rect x="31.7" y="453" width="0.2" height="15.0" fill="rgb(224,172,47)" rx="2" ry="2" />
+<text  x="34.69" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_http_chunked_body_filter (1 samples, 0.01%)</title><rect x="10.0" y="325" width="0.1" height="15.0" fill="rgb(246,41,40)" rx="2" ry="2" />
+<text  x="13.00" y="335.5" ></text>
+</g>
+<g >
+<title>ngx_http_lua_ffi_balancer_set_more_tries (2 samples, 0.02%)</title><rect x="30.8" y="453" width="0.2" height="15.0" fill="rgb(235,102,43)" rx="2" ry="2" />
+<text  x="33.78" y="463.5" ></text>
+</g>
+<g >
+<title>ngx_http_upstream_process_connection (4 samples, 0.03%)</title><rect x="632.1" y="277" width="0.4" height="15.0" fill="rgb(222,79,25)" rx="2" ry="2" />
+<text  x="635.13" y="287.5" ></text>
+</g>
+<g >
+<title>ngx_close_connection (3 samples, 0.03%)</title><rect x="69.5" y="309" width="0.3" height="15.0" fill="rgb(251,42,23)" rx="2" ry="2" />
+<text  x="72.54" y="319.5" ></text>
+</g>
+<g >
+<title>propagatemark (48 samples, 0.41%)</title><rect x="19.8" y="421" width="4.9" height="15.0" fill="rgb(243,76,19)" rx="2" ry="2" />
+<text  x="22.84" y="431.5" ></text>
+</g>
+</g>
+</svg>

@@ -1,0 +1,49 @@
+{
+    "server": {
+        "primary": [
+            {
+                "host": "10.11.14.54:801",
+                "weight": 1
+            },
+            {
+                "host": "10.11.14.54:802",
+                "weight": 1
+            },
+        ],
+        "backup": [
+            {
+                "host": "10.11.14.54:801",
+            }
+        ]
+    }
+    "resolver": {
+            "nameservers": ["10.11.16.10"],
+            "retrans": 5,
+            "timeout": 2000
+    },
+    "retries":3, 
+    "healthcheck":{
+        "active": {
+            "type":"http",
+            "http_path":"/",
+            "healthy": {
+                "interval": 2,
+                "successes": 1
+            },
+            "unhealthy": {
+                "interval": 1,
+                "http_failures": 2
+            }
+        },
+        "passive":{
+            "healthy":{
+                "successes":3
+            },
+            "unhealthy":{
+                "timeouts": 5, 
+                "http_failures":10, 
+                "tcp_failures":3
+            }
+        }
+    }
+}
