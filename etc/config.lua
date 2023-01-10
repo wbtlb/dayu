@@ -4,7 +4,7 @@ _M.store = {
     stype = "consul",
     host = "http://192.168.0.123",
     port = "8500",
-    prefix = "zz/vm-qa-proxy/upstreams",
+    prefix = "test/vm-qa/upstreams",
 }
 
 --_M.plugins = {
